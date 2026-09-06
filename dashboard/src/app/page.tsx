@@ -96,23 +96,23 @@ export default function Dashboard() {
   const [live, setLive] = useState<Live>({});
   const [history, setHistory] = useState<Sample[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [windowSec, setWindowSec] = useState(30);
 
   // Incoming Realtime sample rows are buffered and flushed a few times per
   // second so the charts don't re-render on every single insert (~200/sec).
   const pendingRef = useRef<Sample[]>([]);
+  const windowSecRef = useRef(30);
 
   useEffect(() => {
     let mounted = true;
 
     const loadInitial = async () => {
       try {
-        const [h, a, l] = await Promise.all([
-          fetch("/api/live/history?count=6000", { cache: "no-store" }).then((r) => r.json()),
+        const [a, l] = await Promise.all([
           fetch("/api/alerts", { cache: "no-store" }).then((r) => r.json()),
           fetch("/api/live", { cache: "no-store" }).then((r) => r.json()),
         ]);
         if (!mounted) return;
-        if (Array.isArray(h)) setHistory(h.map((r) => normalizeSample(r)));
         if (Array.isArray(a)) setAlerts(a);
         if (l && typeof l === "object") setLive(l);
       } catch {}
@@ -157,10 +157,14 @@ export default function Dashboard() {
       if (!batch.length) return;
       pendingRef.current = [];
       const latest = batch[batch.length - 1];
-      setHistory((prev) => {
-        const next = [...prev, ...batch];
-        return next.length > 6000 ? next.slice(-6000) : next;
-      });
+      // In windowed (decimated) view the Realtime rows are already represented
+      // by the periodic min-max fetch — only append raw in full-res 30s mode.
+      if (windowSecRef.current <= 30) {
+        setHistory((prev) => {
+          const next = [...prev, ...batch];
+          return next.length > 6000 ? next.slice(-6000) : next;
+        });
+      }
       setLive((prev) => ({
         ...prev,
         node_id: latest.node_id,
@@ -175,23 +179,40 @@ export default function Dashboard() {
       }));
     }, 200);
 
-    // Reconnect fell off the Realtime stream: a slow poll keeps the dashboard
-    // honest without the churn of a fast poll.
-    const slowPoll = setInterval(() => {
-      fetch("/api/live/history?count=6000", { cache: "no-store" })
-        .then((r) => r.json())
-        .then((h) => mounted && Array.isArray(h) && setHistory(h.map((r) => normalizeSample(r))))
-        .catch(() => {});
-    }, 20000);
-
     return () => {
       mounted = false;
       supabase.removeChannel(sampleChannel);
       supabase.removeChannel(alertChannel);
       clearInterval(flush);
-      clearInterval(slowPoll);
     };
   }, []);
+
+  // History window: full 30s @ 200Hz is the fine-grained live tail; longer
+  // windows are min-max decimated server-side so the chart stays at ~6000 pts.
+  useEffect(() => {
+    windowSecRef.current = windowSec;
+    let mounted = true;
+
+    const refresh = async () => {
+      try {
+        const h = await fetch(`/api/live/history?count=6000&window=${windowSec}`, {
+          cache: "no-store",
+        }).then((r) => r.json());
+        if (mounted && Array.isArray(h)) setHistory(h.map((r) => normalizeSample(r)));
+      } catch {}
+    };
+    refresh();
+
+    // Longer windows refresh less often — a 5-minute view updated every
+    // ~60s still looks live, and skips hammering the decimation fetch.
+    const pollMs = Math.min(Math.max(windowSec * 1000 / 2, 20000), 60000);
+    const slowPoll = setInterval(refresh, pollMs);
+
+    return () => {
+      mounted = false;
+      clearInterval(slowPoll);
+    };
+  }, [windowSec]);
 
   const chartData = history.map((s) => ({
     ...s,
@@ -232,6 +253,23 @@ export default function Dashboard() {
             })
           : "never"}{" "}
         (PH)
+      </div>
+
+      <div className="window-row">
+        <span className="window-label">History</span>
+        {[
+          [30, "30s"],
+          [120, "2m"],
+          [300, "5m"],
+        ].map(([sec, label]) => (
+          <button
+            key={sec}
+            className={`window-btn${windowSec === sec ? " active" : ""}`}
+            onClick={() => setWindowSec(sec as number)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       <div className="status-row">

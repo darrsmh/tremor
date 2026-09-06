@@ -402,7 +402,12 @@ struct SampleRec {
     float pga_c, roll, pitch, sigma_f, sigma_a, sigma_m, snr_db;
 };
 
-static SampleRec sRing[1000];  // 5 seconds @ 200 Hz
+// Ring depth = seconds of buffered history. 2000 → 10s of coverage so brief
+// WiFi dropouts (the 5-consecutive-failure reset path ~16s) don't create gaps
+// in the live dashboard history. Memory: 2000 × ~36 B = ~72 KB in BSS — keep
+// this modest so the TLS handshake (needs ~40 KB contiguous heap) still works.
+#define RING_SAMPLES  2000
+static SampleRec sRing[RING_SAMPLES];  // 10 seconds @ 200 Hz
 static volatile int sHead = 0, sTail = 0;
 
 static void taskSensor(void*) {
@@ -537,7 +542,7 @@ static void taskSensor(void*) {
 
         // ── Enqueue into shared ring buffer (200 Hz) ──────────────
         {
-            int next = (sHead + 1) % 1000;
+            int next = (sHead + 1) % RING_SAMPLES;
             if (next != sTail) {
                 sRing[sHead] = { (uint64_t)(g_epochOffsetMs + (int64_t)millis()),
                                  pga_c, g_liveRoll, g_livePitch,
@@ -627,7 +632,7 @@ static void taskWiFiUpload(void*) {
             int peek = sTail;
             while (peek != sHead && cnt < 50) {
                 tmpBuf[cnt] = sRing[peek];
-                peek = (peek + 1) % 1000;
+                peek = (peek + 1) % RING_SAMPLES;
                 cnt++;
             }
             if (cnt) {
