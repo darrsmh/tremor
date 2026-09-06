@@ -67,24 +67,21 @@ const PAGE_SIZE = 1000;
 // and sample with max pga_c) so PGA spikes survive aggregation.
 export async function getSamplesWindowed(count = 6000, windowSeconds = 30) {
   const target = Math.min(count, 6000);
-  // Reference the window to the newest sample ts in the DB, not the server
-  // clock. If the device clock lags real time (NTP skew), a server-clock
-  // `fromTs` silently empties the window even though fresh samples exist.
-  const { data: newest } = await sb()
-    .from("samples")
-    .select("ts")
-    .order("ts", { ascending: false })
-    .limit(1);
-  const maxTs = Number(newest?.[0]?.ts) || Date.now();
-  const fromTs = maxTs - windowSeconds * 1000;
+  // Anchor the window on server-side insertion time (created_at), NOT the
+  // device ts. Device ts can be boot-relative, NTP-skewed, or reset on
+  // reboot — a ts-window then silently returns pre-reboot rows or nothing
+  // even while the device is streaming (frozen graph). created_at is set by
+  // the DB to now() on every insert, so the last N seconds always reflect
+  // what actually arrived in the last N seconds.
+  const fromTs = Date.now() - windowSeconds * 1000;
 
   const rows: Record<string, unknown>[] = [];
   for (let off = 0; off < WINDOW_MAX_ROWS; off += PAGE_SIZE) {
     const { data } = await sb()
       .from("samples")
       .select(SAMPLE_COLUMNS)
-      .gte("ts", fromTs)
-      .order("ts", { ascending: true })
+      .gte("created_at", new Date(fromTs).toISOString())
+      .order("id", { ascending: true })
       .range(off, off + PAGE_SIZE - 1);
     if (!data || data.length === 0) break;
     rows.push(...data);

@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS samples (
 
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts DESC);
 
+-- Window queries filter by server insertion time (device ts can be skew/reboot
+-- relative and must never drive the dashboard window).
+CREATE INDEX IF NOT EXISTS idx_samples_created_at ON samples (created_at);
+
 -- Trim old samples automatically — keep only the latest 2000 rows
 -- via a trigger (Supabase doesn't support automatic row limits natively).
 

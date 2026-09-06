@@ -419,8 +419,9 @@ struct SampleRec {
 // dropouts don't create gaps in the live dashboard history. Memory:
 // 1750 × 40 B = ~70 KB in BSS — kept modest so the TLS handshake (needs
 // ~40 KB contiguous heap) still works.
-#define RING_SAMPLES  1750
-static SampleRec sRing[RING_SAMPLES];  // 8.75 seconds @ 200 Hz
+#define RING_SAMPLES  1700
+#define MAX_BATCH     200   // samples sent per POST (1 s @ 200 Hz)
+static SampleRec sRing[RING_SAMPLES];  // 8.5 seconds @ 200 Hz
 static volatile int sHead = 0, sTail = 0;
 
 static void taskSensor(void*) {
@@ -624,14 +625,12 @@ static void taskWiFiUpload(void*) {
     static int consecutiveFailures = 0;
 
     // Reuse a single JSON document to avoid heap fragmentation.
-    // Sized for up to 100 samples (~130 B/sample) + header. Keeping this small
-    // matters: the TLS handshake needs ~40KB CONTIGUOUS heap, and a large doc
-    // fragments the heap causing "SSL - Memory allocation failed (-32512)".
-    static DynamicJsonDocument doc(12000);
+    // Sized for MAX_BATCH samples (~130 B/sample) + header.
+    static DynamicJsonDocument doc(30000);
 
     // Temp buffer to snapshot ring buffer before POST — prevents data loss on
     // failure. Static so it lives in BSS, not on the 16KB task stack.
-    static SampleRec tmpBuf[50];
+    static SampleRec tmpBuf[MAX_BATCH];
 
     while (true) {
         if (millis() - lastWifi > 30000) {
@@ -650,14 +649,16 @@ static void taskWiFiUpload(void*) {
             }
         }
 
-        // 100ms batch upload (was 500ms)
-        if (millis() - lastUpload >= 100 && WiFi.status() == WL_CONNECTED) {
+        // 1 second batch upload — accumulates ~200 samples @ 200 Hz per POST,
+        // cutting HTTPS request volume ~10x (fewer TLS handshakes, less radio
+        // churn) while Realtime still streams each inserted batch to the page.
+        if (millis() - lastUpload >= 1000 && WiFi.status() == WL_CONNECTED) {
             lastUpload = millis();
 
             // Snapshot samples into temp buffer WITHOUT advancing tail
             int cnt = 0;
             int peek = sTail;
-            while (peek != sHead && cnt < 50) {
+            while (peek != sHead && cnt < MAX_BATCH) {
                 tmpBuf[cnt] = sRing[peek];
                 peek = (peek + 1) % RING_SAMPLES;
                 cnt++;
