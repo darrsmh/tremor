@@ -9,8 +9,9 @@ export async function GET(req: NextRequest) {
   const live = await getLive();
   const debug = req.nextUrl.searchParams.get("debug") === "1";
 
-  let raw: Record<string, unknown> | null = null;
-  let byId: Record<string, unknown> | null = null;
+  let rawAll: unknown = null;
+  let rawErr: unknown = null;
+  let singleErr: unknown = null;
   let url = "";
   if (debug) {
     const sb = createSupabaseServer();
@@ -19,17 +20,19 @@ export async function GET(req: NextRequest) {
       .from("live_state")
       .select("*")
       .eq("node_id", "ADXL345-01");
-    raw = (a.data ?? [])[0] as Record<string, unknown>;
+    rawAll = { rows: a.data, error: a.error, count: a.data?.length };
     const b = await sb
       .from("live_state")
       .select("*")
       .eq("node_id", "ADXL345-01")
       .single();
-    byId = (b.data ?? {}) as Record<string, unknown>;
+    rawErr = b.error;
+    const all = await sb.from("live_state").select("node_id, ts, updated_at");
+    singleErr = all.data;
   }
 
   return NextResponse.json({
     ...(live || {}),
-    ...(debug ? { _debug: { now: Date.now(), url, raw, byId } } : {}),
+    ...(debug ? { _debug: { now: Date.now(), url, rawAll, rawErr, allNodes: singleErr } } : {}),
   });
 }
