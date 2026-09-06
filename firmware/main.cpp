@@ -335,17 +335,25 @@ static bool waitConnected(uint32_t timeoutMs) {
     return WiFi.status() == WL_CONNECTED;
 }
 
+// Begin WiFi and keep the radio awake. A forced WiFi.begin() re-enables
+// power-save by default (a known cause of dropped sends / HTTPC_ERROR_SEND_
+// PAYLOAD_FAILED), so we re-assert setSleep(false) on every (re)start.
+static void beginWifi() {
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.setSleep(false);
+}
+
 static void wifiReconnect() {
     if (WiFi.status() != WL_CONNECTED) {
         WiFi.disconnect(true); delay(500);
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        beginWifi();
         if (!waitConnected(15000)) return;
 
         IPAddress resolved;
         if (!WiFi.hostByName("ethylnode.vercel.app", resolved)) {
             Serial.println("[WiFi] DNS resolve failed — forcing reconnect");
             WiFi.disconnect(true); delay(500);
-            WiFi.begin(WIFI_SSID, WIFI_PASS);
+            beginWifi();
             waitConnected(15000);
         }
     }
@@ -602,7 +610,7 @@ static void taskSensor(void*) {
 //  CORE 1 TASK A — WiFi continuous upload (5-second batches)
 // ════════════════════════════════════════════════════════════════════
 static void taskWiFiUpload(void*) {
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    beginWifi();
     {
         uint32_t t = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) delay(300);
@@ -686,14 +694,29 @@ static void taskWiFiUpload(void*) {
                 bool ok = (code >= 200 && code < 300);
                 if (!ok) {
                     consecutiveFailures++;
-                    if (consecutiveFailures >= 5) {
+
+                    // Distinguish a transient send failure from a hard failure.
+                    // -3 (HTTPC_ERROR_SEND_PAYLOAD_FAILED) means the TCP/TLS write
+                    // dropped mid-chunk — nearly always a brief radio glitch that
+                    // self-recovers. A full WiFi teardown (disconnect+begin) blocks
+                    // THIS upload task for up to 15 s and lets the shallow ring
+                    // buffer overwrite the exact samples we need to send, so we
+                    // refuse to tear down on first -3s and instead wait through
+                    // a higher strike count for it to pass.
+                    bool transient = (code == HTTPC_ERROR_SEND_PAYLOAD_FAILED);
+                    int  threshold = transient ? 20 : 5;
+                    if (consecutiveFailures >= threshold) {
                         Serial.printf("[WiFi] %d consecutive HTTP failures (last=%d) — resetting WiFi\n",
                                       consecutiveFailures, code);
                         WiFi.disconnect(true);
                         delay(1000);
-                        WiFi.begin(WIFI_SSID, WIFI_PASS);
+                        beginWifi();          // re-asserts WiFi.setSleep(false)
                         waitConnected(15000);
                         consecutiveFailures = 0;
+                    } else if (transient) {
+                        // Ride out the blip — pause briefly so we don't hammer a
+                        // flaky link with 10 failed POSTs/sec, then retry.
+                        delay(200);
                     }
                 } else {
                     consecutiveFailures = 0;
