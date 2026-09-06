@@ -157,14 +157,13 @@ export default function Dashboard() {
       if (!batch.length) return;
       pendingRef.current = [];
       const latest = batch[batch.length - 1];
-      // In windowed (decimated) view the Realtime rows are already represented
-      // by the periodic min-max fetch — only append raw in full-res 30s mode.
-      if (windowSecRef.current <= 30) {
-        setHistory((prev) => {
-          const next = [...prev, ...batch];
-          return next.length > 6000 ? next.slice(-6000) : next;
-        });
-      }
+      // Append realtime rows in all window modes — the periodic poll will
+      // replace with properly decimated data; raw rows between polls are
+      // negligible and keep the graph visibly streaming.
+      setHistory((prev) => {
+        const next = [...prev, ...batch];
+        return next.length > 6000 ? next.slice(-6000) : next;
+      });
       setLive((prev) => ({
         ...prev,
         node_id: latest.node_id,
@@ -229,11 +228,15 @@ export default function Dashboard() {
   // newest history sample. Averaged against server ingestion time so a stale
   // /api/live row doesn't falsely show OFFLINE while data is flowing.
   let online = false;
-  const lastLiveTs = live.ts ?? history[history.length - 1]?.ts;
-  if (lastLiveTs && lastLiveTs > 1000000000000) {
-    online = Date.now() - lastLiveTs < 30000;
-  } else if (live.updated_at) {
-    online = Date.now() - new Date(live.updated_at).getTime() < 30000;
+  if (live.updated_at) {
+    // Prefer updated_at (server-receive time, always accurate) over device ts
+    // which can lag behind real time when NTP drifts.
+    online = Date.now() - new Date(live.updated_at).getTime() < 60000;
+  } else {
+    const lastLiveTs = live.ts ?? history[history.length - 1]?.ts;
+    if (lastLiveTs && lastLiveTs > 1000000000000) {
+      online = Date.now() - lastLiveTs < 60000;
+    }
   }
 
   return (
