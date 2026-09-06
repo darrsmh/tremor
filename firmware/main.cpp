@@ -353,17 +353,20 @@ static void wifiReconnect() {
 
 // ── NTP: real epoch time (ms) offset vs millis() ─────────────────────
 static volatile int64_t g_epochOffsetMs = 0;  // epochMillis = offset + millis()
+static uint32_t g_lastNtpMs = 0;              // last successful sync — re-sync periodically
 
 static void syncNTP() {
     configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
     time_t now = 0;
     uint32_t t0 = millis();
+    uint32_t tSync = t0;
     while (now < 100000 && millis() - t0 < 10000) {
         time(&now);
         delay(200);
     }
     if (now >= 100000) {
-        g_epochOffsetMs = (int64_t)now * 1000 - (int64_t)millis();
+        tSync = millis();
+        g_epochOffsetMs = (int64_t)now * 1000 - (int64_t)tSync;
         Serial.printf("[TIME] NTP sync OK, epoch=%ld offsetMs=%lld\n", (long)now, (long long)g_epochOffsetMs);
     } else {
         Serial.println("[TIME] NTP sync failed, using boot-relative time");
@@ -403,12 +406,13 @@ struct SampleRec {
 };
 
 // Ring depth = seconds of buffered history. 2000 → 10s of coverage overflows
-// DRAM (region dram0_0_seg, ~124 KB of static data) by >5 KB, so we cap at
-// 1500 → 7.5s of coverage so brief WiFi dropouts don't create gaps in the live
-// dashboard history. Memory: 1500 × 40 B = ~60 KB in BSS — kept modest so the
-// TLS handshake (needs ~40 KB contiguous heap) still works.
-#define RING_SAMPLES  1500
-static SampleRec sRing[RING_SAMPLES];  // 7.5 seconds @ 200 Hz
+// DRAM (region dram0_0_seg, ~124 KB of static data) by >5 KB; 1750 adds
+// emergency depth (~8.75s) while staying under the limit so brief WiFi
+// dropouts don't create gaps in the live dashboard history. Memory:
+// 1750 × 40 B = ~70 KB in BSS — kept modest so the TLS handshake (needs
+// ~40 KB contiguous heap) still works.
+#define RING_SAMPLES  1750
+static SampleRec sRing[RING_SAMPLES];  // 8.75 seconds @ 200 Hz
 static volatile int sHead = 0, sTail = 0;
 
 static void taskSensor(void*) {
@@ -628,8 +632,14 @@ static void taskWiFiUpload(void*) {
             // Keep retrying NTP until it succeeds. If the epoch offset is never
             // armed, sample ts stays boot-relative (~millis since boot, tiny
             // values) — the backend trim trigger then deletes every insert and
-            // the dashboard window queries treat them as stale.
-            if (g_epochOffsetMs == 0) syncNTP();
+            // the dashboard window queries treat them as stale. Also re-sync
+            // every 15 min: the offset is computed from a single time() capture,
+            // so a stale/frozen capture would otherwise skew the clock and push
+            // every sample outside the dashboard's "last N seconds" window.
+            if (g_epochOffsetMs == 0 || millis() - g_lastNtpMs > 900000) {
+                syncNTP();
+                g_lastNtpMs = millis();
+            }
         }
 
         // 100ms batch upload (was 500ms)

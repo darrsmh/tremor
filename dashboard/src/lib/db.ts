@@ -67,7 +67,16 @@ const PAGE_SIZE = 1000;
 // and sample with max pga_c) so PGA spikes survive aggregation.
 export async function getSamplesWindowed(count = 6000, windowSeconds = 30) {
   const target = Math.min(count, 6000);
-  const fromTs = Date.now() - windowSeconds * 1000;
+  // Reference the window to the newest sample ts in the DB, not the server
+  // clock. If the device clock lags real time (NTP skew), a server-clock
+  // `fromTs` silently empties the window even though fresh samples exist.
+  const { data: newest } = await sb()
+    .from("samples")
+    .select("ts")
+    .order("ts", { ascending: false })
+    .limit(1);
+  const maxTs = Number(newest?.[0]?.ts) || Date.now();
+  const fromTs = maxTs - windowSeconds * 1000;
 
   const rows: Record<string, unknown>[] = [];
   for (let off = 0; off < WINDOW_MAX_ROWS; off += PAGE_SIZE) {
