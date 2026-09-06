@@ -23,9 +23,8 @@ export async function getLive() {
   const { data } = await sb()
     .from("live_state")
     .select("*")
-    .eq("node_id", "ADXL345-01")
-    .single();
-  return (data ?? {}) as Record<string, unknown>;
+    .eq("node_id", "ADXL345-01");
+  return (data?.[0] ?? {}) as Record<string, unknown>;
 }
 
 // ── Samples ───────────────────────────────────────────────────
@@ -148,7 +147,6 @@ export async function getHeartbeat(nodeId: string) {
   const { data } = await sb()
     .from("heartbeats")
     .select("*")
-    .eq("node_id", nodeId)
-    .single();
-  return data ?? {};
+    .eq("node_id", nodeId);
+  return data?.[0] ?? {};
 }
