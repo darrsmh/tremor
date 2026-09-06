@@ -83,12 +83,15 @@ ALTER PUBLICATION supabase_realtime ADD TABLE alerts;
 -- =============================================================
 -- Auto-trim: keep only the latest 10000 samples
 -- (headroom above the 6000-point graph fetch so ~30s @ 200Hz persists)
+-- Trim by insertion order (id DESC), NOT sensor ts: a node that loses NTP
+-- sync can report boot-relative ts (tiny values) and would otherwise have
+-- every new row treated as "oldest" and deleted on insert.
 -- =============================================================
 CREATE OR REPLACE FUNCTION trim_samples() RETURNS trigger AS $$
 BEGIN
   DELETE FROM samples
   WHERE id NOT IN (
-    SELECT id FROM samples ORDER BY ts DESC LIMIT 10000
+    SELECT id FROM samples ORDER BY id DESC LIMIT 10000
   );
   RETURN NULL;
 END;

@@ -402,12 +402,13 @@ struct SampleRec {
     float pga_c, roll, pitch, sigma_f, sigma_a, sigma_m, snr_db;
 };
 
-// Ring depth = seconds of buffered history. 2000 → 10s of coverage so brief
-// WiFi dropouts (the 5-consecutive-failure reset path ~16s) don't create gaps
-// in the live dashboard history. Memory: 2000 × ~36 B = ~72 KB in BSS — keep
-// this modest so the TLS handshake (needs ~40 KB contiguous heap) still works.
-#define RING_SAMPLES  2000
-static SampleRec sRing[RING_SAMPLES];  // 10 seconds @ 200 Hz
+// Ring depth = seconds of buffered history. 2000 → 10s of coverage overflows
+// DRAM (region dram0_0_seg, ~124 KB of static data) by >5 KB, so we cap at
+// 1500 → 7.5s of coverage so brief WiFi dropouts don't create gaps in the live
+// dashboard history. Memory: 1500 × 40 B = ~60 KB in BSS — kept modest so the
+// TLS handshake (needs ~40 KB contiguous heap) still works.
+#define RING_SAMPLES  1500
+static SampleRec sRing[RING_SAMPLES];  // 7.5 seconds @ 200 Hz
 static volatile int sHead = 0, sTail = 0;
 
 static void taskSensor(void*) {
@@ -621,7 +622,15 @@ static void taskWiFiUpload(void*) {
     static SampleRec tmpBuf[50];
 
     while (true) {
-        if (millis() - lastWifi > 30000) { lastWifi = millis(); wifiReconnect(); }
+        if (millis() - lastWifi > 30000) {
+            lastWifi = millis();
+            wifiReconnect();
+            // Keep retrying NTP until it succeeds. If the epoch offset is never
+            // armed, sample ts stays boot-relative (~millis since boot, tiny
+            // values) — the backend trim trigger then deletes every insert and
+            // the dashboard window queries treat them as stale.
+            if (g_epochOffsetMs == 0) syncNTP();
+        }
 
         // 100ms batch upload (was 500ms)
         if (millis() - lastUpload >= 100 && WiFi.status() == WL_CONNECTED) {
