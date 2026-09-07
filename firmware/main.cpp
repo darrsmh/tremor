@@ -338,9 +338,32 @@ static bool waitConnected(uint32_t timeoutMs) {
 // Begin WiFi and keep the radio awake. A forced WiFi.begin() re-enables
 // power-save by default (a known cause of dropped sends / HTTPC_ERROR_SEND_
 // PAYLOAD_FAILED), so we re-assert setSleep(false) on every (re)start.
+// setTxPower(19.5 dBm) maximizes output for weak/marginal links — the cause
+// of NO_AP_FOUND / 4WAY_HANDSHAKE_TIMEOUT / mid-payload -3 drops seen here.
 static void beginWifi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);  // max output — helps weak-signal cases
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     WiFi.setSleep(false);
+}
+
+// Print every visible network once (boot diagnostic). Lets you confirm the
+// ESP32 can actually see the target AP and at what signal strength — a
+// persistent -3 (send payload failed) with healthy heap usually means the
+// radio is at the edge of range (weak RSSI), not a code fault.
+static void scanWifi() {
+    int n = WiFi.scanNetworks();
+    Serial.printf("[WiFiScan] %d networks found:\n", n);
+    for (int i = 0; i < n; i++) {
+        Serial.printf("[WiFiScan]   %2d. %-32s ch=%2d rssi=%4d dBm %s\n",
+                      i + 1,
+                      WiFi.SSID(i).c_str(),
+                      WiFi.channel(i),
+                      WiFi.RSSI(i),
+                      WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "(open)" : "(sec)");
+    }
+    WiFi.scanDelete();
 }
 
 static void wifiReconnect() {
@@ -413,15 +436,18 @@ struct SampleRec {
     float pga_c, roll, pitch, sigma_f, sigma_a, sigma_m, snr_db;
 };
 
-// Ring depth = seconds of buffered history. 2000 → 10s of coverage overflows
-// DRAM (region dram0_0_seg, ~124 KB of static data) by >5 KB; 1750 adds
-// emergency depth (~8.75s) while staying under the limit so brief WiFi
-// dropouts don't create gaps in the live dashboard history. Memory:
-// 1750 × 40 B = ~70 KB in BSS — kept modest so the TLS handshake (needs
-// ~40 KB contiguous heap) still works.
-#define RING_SAMPLES  1700
-#define MAX_BATCH     200   // samples sent per POST (1 s @ 200 Hz)
-static SampleRec sRing[RING_SAMPLES];  // 8.5 seconds @ 200 Hz
+// Ring depth = seconds of buffered history. Keep it small: the ESP32's internal
+// DRAM region is shared with the heap, and a big static ring tops out the
+// contiguous free block. mbedTLS's ssl_setup() needs ~45KB CONTIGUOUS for its
+// in/out buffers + handshake context, but a 68KB ring (1700×40B) pins maxAlloc
+// at ~43KB and every HTTPS handshake dies with -32512 (SSL_ALLOC_FAILED) /
+// -17040 (RSA BIGNUM OOM). 1024×40B = ~41KB BSS → frees ~27KB of contiguous
+// DRAM so the TLS setup fits. ~5.1s at 200 Hz covers the 1s upload cadence.
+#define RING_SAMPLES  1024
+#define MAX_BATCH     100   // samples per POST — halved from 200 so each ~12KB
+                            // TLS write completes reliably on marginal 2.4 GHz
+                            // (a 24KB single write was dropping as -3 SEND_PAYLOAD_FAILED)
+static SampleRec sRing[RING_SAMPLES];  // 5 seconds @ 200 Hz
 static volatile int sHead = 0, sTail = 0;
 
 static void taskSensor(void*) {
@@ -619,18 +645,17 @@ static void taskWiFiUpload(void*) {
     Serial.printf("[WiFi] %s\n",
         WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "OFFLINE");
     if (WiFi.status() == WL_CONNECTED) { setStaticDNS(); syncNTP(); }
+    scanWifi();  // boot-time diagnostic — shows every AP in range + RSSI
     WiFi.setSleep(false);  // keep radio awake for low-latency sends
 
     uint32_t lastUpload = 0, lastWifi = 0;
     static int consecutiveFailures = 0;
 
-    // Reuse a single JSON document to avoid heap fragmentation.
-    // Sized for MAX_BATCH samples (~130 B/sample) + header.
-    static DynamicJsonDocument doc(30000);
-
-    // Temp buffer to snapshot ring buffer before POST — prevents data loss on
-    // failure. Static so it lives in BSS, not on the 16KB task stack.
-    static SampleRec tmpBuf[MAX_BATCH];
+    // Snapshot NOT taken: the ring is read directly because sTail only advances
+    // on a successful POST, so ring[tail..tail+cnt) is stable while serializing.
+    // (RING_SAMPLES=1024 >> MAX_BATCH=100, so the sensor task cannot wrap onto a
+    // tail that upload has not yet released.)
+    static char postBuf[64 + MAX_BATCH * 160];
 
     while (true) {
         if (millis() - lastWifi > 30000) {
@@ -649,43 +674,64 @@ static void taskWiFiUpload(void*) {
             }
         }
 
-        // 1 second batch upload — accumulates ~200 samples @ 200 Hz per POST,
-        // cutting HTTPS request volume ~10x (fewer TLS handshakes, less radio
-        // churn) while Realtime still streams each inserted batch to the page.
-        if (millis() - lastUpload >= 1000 && WiFi.status() == WL_CONNECTED) {
+        // 500 ms batch upload — accumulates ~100 samples @ 200 Hz per POST,
+        // cutting HTTPS request volume vs per-100ms while keeping each payload
+        // small enough (~12KB) that the TLS write completes even on a flaky
+        // link. Realtime still streams each inserted batch to the page.
+        if (millis() - lastUpload >= 500 && WiFi.status() == WL_CONNECTED) {
             lastUpload = millis();
 
-            // Snapshot samples into temp buffer WITHOUT advancing tail
+            // Count samples available WITHOUT advancing tail. The ring is read
+            // directly during serialization (sTail only moves on success, and
+            // the sensor task can never wrap onto a tail the uploader still
+            // owns), so no temp buffer is needed.
             int cnt = 0;
             int peek = sTail;
             while (peek != sHead && cnt < MAX_BATCH) {
-                tmpBuf[cnt] = sRing[peek];
                 peek = (peek + 1) % RING_SAMPLES;
                 cnt++;
             }
             if (cnt) {
-                doc.clear();
-                doc["node_id"]     = "ADXL345-01";
-                doc["fw"]          = "2.0.0";
-                doc["threshold_g"] = DETECT_THRESHOLD_G;
-                doc["cf_alpha"]    = CF_ALPHA;
-                doc["w_adxl"]      = W_ADXL;
-                doc["w_mpu"]       = W_MPU;
+                // Build the JSON body inside a scope so the ArduinoJson document
+                // is DESTROYED before the HTTPS request. TLS on the ESP32 needs a
+                // large CONTIGUOUS heap block for its handshake buffers (~32-40KB);
+                // a long-lived 30KB doc held across the POST fragmented the heap and
+                // made every handshake fail with -32512 (SSL_ALLOC_FAILED), then
+                // -17040 (RSA BIGNUM alloc) as the server cert keys couldn't load.
+                // Reserve only ~what the body actually needs (~80 B/sample) so the
+                // biggest free heap block stays large enough for the TLS setup.
+                int postLen = 0;
+                {
+                    JsonDocument doc;
+                    doc["node_id"]     = "ADXL345-01";
+                    doc["fw"]          = "2.0.0";
+                    doc["threshold_g"] = DETECT_THRESHOLD_G;
+                    doc["cf_alpha"]    = CF_ALPHA;
+                    doc["w_adxl"]      = W_ADXL;
+                    doc["w_mpu"]       = W_MPU;
 
-                JsonArray arr = doc.createNestedArray("samples");
-                for (int i = 0; i < cnt; i++) {
-                    JsonObject s = arr.createNestedObject();
-                    s["ts"]      = tmpBuf[i].ts;
-                    s["pga_c"]   = tmpBuf[i].pga_c;
-                    s["roll"]    = tmpBuf[i].roll;
-                    s["pitch"]   = tmpBuf[i].pitch;
-                    s["sigma_f"] = tmpBuf[i].sigma_f;
-                    s["sigma_a"] = tmpBuf[i].sigma_a;
-                    s["sigma_m"] = tmpBuf[i].sigma_m;
-                    s["snr_db"]  = tmpBuf[i].snr_db;
-                }
-                String body; serializeJson(doc, body);
-                int code = netIngestPost(body);
+                    JsonArray arr = doc["samples"].to<JsonArray>();
+                    int src = sTail;
+                    for (int i = 0; i < cnt; i++) {
+                        JsonObject s = arr.add<JsonObject>();
+                        s["ts"]      = sRing[src].ts;
+                        s["pga_c"]   = sRing[src].pga_c;
+                        s["roll"]    = sRing[src].roll;
+                        s["pitch"]   = sRing[src].pitch;
+                        s["sigma_f"] = sRing[src].sigma_f;
+                        s["sigma_a"] = sRing[src].sigma_a;
+                        s["sigma_m"] = sRing[src].sigma_m;
+                        s["snr_db"]  = sRing[src].snr_db;
+                        src = (src + 1) % RING_SAMPLES;
+                    }
+                    postLen = serializeJson(doc, postBuf, sizeof(postBuf));
+                    if (postLen >= (int)sizeof(postBuf) - 1) {
+                        Serial.printf("[NET] WARNING postBuf truncated! postLen=%d need=%u cap=%u\n",
+                                      postLen, (unsigned)measureJson(doc), (unsigned)sizeof(postBuf));
+                    }
+                }  // doc freed here — TLS handshake now sees a large free block
+
+                int code = netIngestPost(postBuf, postLen);
 
                 // Treat ANY non-2xx/3xx as a failure. 401 (API key mismatch),
                 // 4xx (bad path), and 5xx (server error) all mean the batch was
@@ -724,8 +770,8 @@ static void taskWiFiUpload(void*) {
                     // Success — advance tail past the samples we just sent
                     sTail = peek;
                 }
-                Serial.printf("[WiFi] %d samples → HTTP %d %s | freeHeap=%d | sTail=%d\n",
-                              cnt, code, ok ? "OK" : "FAIL", ESP.getFreeHeap(), sTail);
+                Serial.printf("[WiFi] %d samples → HTTP %d %s | RSSI=%d dBm freeHeap=%d | sTail=%d\n",
+                              cnt, code, ok ? "OK" : "FAIL", WiFi.RSSI(), ESP.getFreeHeap(), sTail);
             }
         }
 
