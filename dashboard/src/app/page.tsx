@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import {
   LineChart,
   Line,
@@ -74,14 +74,33 @@ function ago(ms: number) {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
+// X-axis tick / tooltip label: epoch-ms → HH:MM:SS (Philippine time).
+function fmtTimeTick(v: unknown) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 1000000000000) return "";
+  return new Date(n).toLocaleTimeString("en-US", {
+    timeZone: "Asia/Manila",
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 // Supabase Realtime serializes BIGINT columns (like `ts`) as JSON strings to
 // avoid precision loss > 2^53. Normalize them back to numbers so the chart
 // X-axis, `new Date(ts)`, and the online check all receive numeric ms.
-function normalizeSample(row: Record<string, unknown>): Sample {
+// Also reject implausible ts values (a ~1.78e15 row was observed in history —
+// garbage that pushed the X-axis to "year 56600" and broke the chart).
+function normalizeSample(row: Record<string, unknown>): Sample | null {
   const toNum = (v: unknown) => (v === null || v === undefined || v === "" ? NaN : Number(v));
+  const ts = toNum(row.ts);
+  if (!Number.isFinite(ts) || ts < 1000000000000 || ts > 2000000000000) {
+    return null; // outside 2001..2033 epoch-ms — boot uptime / garbage, drop it
+  }
   return {
     node_id: (row.node_id as string) ?? undefined,
-    ts: toNum(row.ts),
+    ts,
     pga_c: toNum(row.pga_c),
     sigma_f: toNum(row.sigma_f),
     sigma_a: toNum(row.sigma_a),
@@ -90,6 +109,27 @@ function normalizeSample(row: Record<string, unknown>): Sample {
     roll: toNum(row.roll),
     pitch: toNum(row.pitch),
   };
+}
+
+// Client-side min/max decimation so the chart never renders more than
+// ~2000 points even when the history window holds more (defends the paint).
+function decimateForRender(rows: Sample[], maxPoints: number): Sample[] {
+  if (rows.length <= maxPoints) return rows;
+  const buckets = Math.floor(maxPoints / 2);
+  const out: Sample[] = [];
+  for (let i = 0; i < buckets; i++) {
+    const s = Math.floor((i * rows.length) / buckets);
+    const e = Math.min(rows.length, Math.floor(((i + 1) * rows.length) / buckets));
+    if (s >= e) continue;
+    let lo = rows[s];
+    let hi = rows[s];
+    for (let j = s + 1; j < e; j++) {
+      if (rows[j].pga_c < lo.pga_c) lo = rows[j];
+      if (rows[j].pga_c > hi.pga_c) hi = rows[j];
+    }
+    out.push(lo, hi);
+  }
+  return out;
 }
 
 export default function Dashboard() {
@@ -127,7 +167,8 @@ export default function Dashboard() {
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "samples" },
         (payload) => {
-          pendingRef.current.push(normalizeSample(payload.new as Record<string, unknown>));
+          const s = normalizeSample(payload.new as Record<string, unknown>);
+          if (s) pendingRef.current.push(s);
         }
       )
       .subscribe();
@@ -197,7 +238,17 @@ export default function Dashboard() {
         const h = await fetch(`/api/live/history?count=6000&window=${windowSec}`, {
           cache: "no-store",
         }).then((r) => r.json());
-        if (mounted && Array.isArray(h)) setHistory(h.map((r) => normalizeSample(r)));
+        if (!mounted || !Array.isArray(h)) return;
+        const clean = h
+          .map((r) => normalizeSample(r as Record<string, unknown>))
+          .filter((x): x is Sample => x !== null);
+        // NEVER erase the graph on an empty poll. A window query legitimately
+        // returns [] when the radio has been silent longer than the window;
+        // wiping here replaced good data with a blank "Waiting for data..."
+        // chart on every 20s poll (the frozen-graph bug). Instead, only adopt
+        // a server snapshot when it actually contains rows, and let the
+        // realtime flush keep appending raw rows the rest of the time.
+        if (clean.length > 0) setHistory(clean);
       } catch {}
     };
     refresh();
@@ -213,16 +264,13 @@ export default function Dashboard() {
     };
   }, [windowSec]);
 
-  const chartData = history.map((s) => ({
-    ...s,
-    time: new Date(s.ts).toLocaleTimeString("en-US", {
-      timeZone: "Asia/Manila",
-      hour12: false,
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    }),
-  }));
+  // Render-decimate to ≤2000 points (defends paint cost) and memoize; the
+  // X-axis uses numeric ts (recharts `scale="time"`) so there's no per-point
+  // toLocaleTimeString work on every render.
+  const chartData = useMemo(
+    () => decimateForRender(history, 2000),
+    [history]
+  );
 
   // Online if the latest live timestamp is recent, else fall back to the
   // newest history sample. Averaged against server ingestion time so a stale
@@ -249,12 +297,15 @@ export default function Dashboard() {
       </h1>
       <div className="subtitle">
         Node {live.node_id ?? "--"} | Last update{" "}
-        {live.ts
-          ? new Date(Number(live.ts)).toLocaleTimeString("en-US", {
-              timeZone: "Asia/Manila",
-              hour12: false,
-            })
-          : "never"}{" "}
+        {(() => {
+          const t = epochMs(live.ts) || (live.updated_at ? epochMs(live.updated_at) : NaN);
+          return Number.isFinite(t)
+            ? new Date(t).toLocaleTimeString("en-US", {
+                timeZone: "Asia/Manila",
+                hour12: false,
+              })
+            : "never";
+        })()}{" "}
         (PH)
       </div>
 
@@ -333,11 +384,19 @@ export default function Dashboard() {
           <ResponsiveContainer width="100%" height={300}>
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-              <XAxis dataKey="time" tick={{ fontSize: 11, fill: "#666" }} />
+              <XAxis
+                dataKey="ts"
+                type="number"
+                scale="time"
+                domain={["dataMin", "dataMax"]}
+                tickFormatter={fmtTimeTick}
+                tick={{ fontSize: 11, fill: "#666" }}
+              />
               <YAxis tick={{ fontSize: 11, fill: "#666" }} />
               <Tooltip
                 contentStyle={{ background: "#1a1a2a", border: "1px solid #333", borderRadius: 4 }}
                 labelStyle={{ color: "#888" }}
+                labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="pga_c" stroke="#ef4444" dot={false} name="PGA" />
@@ -357,11 +416,19 @@ export default function Dashboard() {
           <ResponsiveContainer width="100%" height={200}>
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-              <XAxis dataKey="time" tick={{ fontSize: 11, fill: "#666" }} />
+              <XAxis
+                dataKey="ts"
+                type="number"
+                scale="time"
+                domain={["dataMin", "dataMax"]}
+                tickFormatter={fmtTimeTick}
+                tick={{ fontSize: 11, fill: "#666" }}
+              />
               <YAxis tick={{ fontSize: 11, fill: "#666" }} />
               <Tooltip
                 contentStyle={{ background: "#1a1a2a", border: "1px solid #333", borderRadius: 4 }}
                 labelStyle={{ color: "#888" }}
+                labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="roll" stroke="#a855f7" dot={false} name="Roll" />

@@ -57,54 +57,28 @@ export async function getSamples(count = 200) {
   return (data ?? []).reverse();
 }
 
-// Largest row scan per request. 200 Hz × 300 s = 60,000 rows — enough to cover
-// the longest preset window without returning tens of megabytes per request.
-const WINDOW_MAX_ROWS = 60000;
-const PAGE_SIZE = 1000;
-
-// Fetch all samples with ts within the last `windowSeconds`, then min-max
-// decimate to ≤ `count` points. Two points per bucket (sample with min pga_c
-// and sample with max pga_c) so PGA spikes survive aggregation.
+// Anchor windowed queries on server-side insertion time (created_at), NOT the
+// device ts. Device ts can be boot-relative, NTP-skewed, or reset on reboot —
+// a ts-window then silently returns pre-reboot rows or nothing even while the
+// device is streaming (frozen graph). created_at is set by the DB to now() on
+// every insert, so the last N seconds always reflect what actually arrived.
+//
+// Decimation runs in Postgres (get_samples_window RPC, supabase/rpc_window.sql):
+// returns min-pga + max-pga rows per bucket so PGA spikes survive aggregation,
+// in ONE query. The old client-side 1000-row pagination loop made the 2m/5m
+// windows do up to 60 sequential Supabase calls per request (~5-10s of latency).
 export async function getSamplesWindowed(count = 6000, windowSeconds = 30) {
   const target = Math.min(count, 6000);
-  // Anchor the window on server-side insertion time (created_at), NOT the
-  // device ts. Device ts can be boot-relative, NTP-skewed, or reset on
-  // reboot — a ts-window then silently returns pre-reboot rows or nothing
-  // even while the device is streaming (frozen graph). created_at is set by
-  // the DB to now() on every insert, so the last N seconds always reflect
-  // what actually arrived in the last N seconds.
-  const fromTs = Date.now() - windowSeconds * 1000;
-
-  const rows: Record<string, unknown>[] = [];
-  for (let off = 0; off < WINDOW_MAX_ROWS; off += PAGE_SIZE) {
-    const { data } = await sb()
-      .from("samples")
-      .select(SAMPLE_COLUMNS)
-      .gte("created_at", new Date(fromTs).toISOString())
-      .order("id", { ascending: true })
-      .range(off, off + PAGE_SIZE - 1);
-    if (!data || data.length === 0) break;
-    rows.push(...data);
-    if (data.length < PAGE_SIZE) break;
+  const { data, error } = await sb().rpc("get_samples_window", {
+    node_id_param: "ADXL345-01",
+    window_seconds: windowSeconds,
+    target_points: target,
+  });
+  if (error) {
+    console.error("get_samples_window RPC error:", error);
+    return [];
   }
-  if (rows.length <= target) return rows;
-
-  const buckets = Math.floor(target / 2);
-  const size = rows.length / buckets;
-  const out: Record<string, unknown>[] = [];
-  for (let i = 0; i < buckets; i++) {
-    const s = Math.floor(i * size);
-    const e = Math.min(rows.length, Math.floor((i + 1) * size));
-    if (s >= e) continue;
-    let lo = rows[s];
-    let hi = rows[s];
-    for (let j = s + 1; j < e; j++) {
-      if (Number(rows[j].pga_c) < Number(lo.pga_c)) lo = rows[j];
-      if (Number(rows[j].pga_c) > Number(hi.pga_c)) hi = rows[j];
-    }
-    out.push(lo, hi);
-  }
-  return out;
+  return (data ?? []) as Record<string, unknown>[];
 }
 
 // ── Alerts ────────────────────────────────────────────────────
