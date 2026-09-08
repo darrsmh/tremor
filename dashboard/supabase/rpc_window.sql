@@ -61,9 +61,11 @@ BEGIN
     FROM numbered n
     ORDER BY n.bucket, n.pga_c DESC, n.ts DESC
   )
-  SELECT node_id, ts, pga_c, sigma_f, sigma_a, sigma_m, snr_db, roll, pitch FROM lo
+  SELECT l.node_id, l.ts, l.pga_c, l.sigma_f, l.sigma_a, l.sigma_m, l.snr_db, l.roll, l.pitch
+  FROM lo l
   UNION ALL
-  SELECT node_id, ts, pga_c, sigma_f, sigma_a, sigma_m, snr_db, roll, pitch FROM hi
+  SELECT h.node_id, h.ts, h.pga_c, h.sigma_f, h.sigma_a, h.sigma_m, h.snr_db, h.roll, h.pitch
+  FROM hi h
   ORDER BY ts ASC;
 END;
 $$;
