@@ -111,25 +111,54 @@ function normalizeSample(row: Record<string, unknown>): Sample | null {
   };
 }
 
-// Client-side min/max decimation so the chart never renders more than
-// ~2000 points even when the history window holds more (defends the paint).
-function decimateForRender(rows: Sample[], maxPoints: number): Sample[] {
-  if (rows.length <= maxPoints) return rows;
-  const buckets = Math.floor(maxPoints / 2);
-  const out: Sample[] = [];
-  for (let i = 0; i < buckets; i++) {
-    const s = Math.floor((i * rows.length) / buckets);
-    const e = Math.min(rows.length, Math.floor(((i + 1) * rows.length) / buckets));
-    if (s >= e) continue;
-    let lo = rows[s];
-    let hi = rows[s];
-    for (let j = s + 1; j < e; j++) {
-      if (rows[j].pga_c < lo.pga_c) lo = rows[j];
-      if (rows[j].pga_c > hi.pga_c) hi = rows[j];
+// Largest-Triangle-Three-Buckets downsampling. Keeps points in temporal order
+// and preserves spikes while dropping to ~maxPoints, unlike min/max pairs
+// (which zigzag within each time slice and rendered as a jagged sawtooth) or
+// plain averaging (which smears spikes). Also lightens the SVG path so the
+// chart paints smoothly.
+function decimateForRender(rows: Sample[], threshold: number): Sample[] {
+  const n = rows.length;
+  if (threshold <= 0 || threshold >= n) return rows;
+  const sampled: Sample[] = [];
+  const every = (n - 2) / (threshold - 2);
+  let a = 0;
+  sampled.push(rows[a]);
+
+  const tsOf = (i: number) => rows[i].ts;
+  const yOf = (i: number) => rows[i].pga_c;
+
+  for (let i = 0; i < threshold - 2; i++) {
+    const avgRangeStart = Math.floor((i + 1) * every) + 1;
+    const avgRangeEnd = Math.min(Math.floor((i + 2) * every) + 1, n);
+    let avgX = 0;
+    let avgY = 0;
+    const len = avgRangeEnd - avgRangeStart;
+    for (let j = avgRangeStart; j < avgRangeEnd; j++) {
+      avgX += tsOf(j);
+      avgY += yOf(j);
     }
-    out.push(lo, hi);
+    avgX /= len;
+    avgY /= len;
+
+    const rangeOffs = Math.max(Math.floor(i * every) + 1, 0);
+    const rangeTo = Math.max(Math.floor((i + 1) * every) + 1, 0);
+    const ax = tsOf(a);
+    const ay = yOf(a);
+    let maxArea = -1;
+    let maxAreaPoint = a;
+    for (let j = rangeOffs; j < rangeTo; j++) {
+      const area = Math.abs((ax - avgX) * (yOf(j) - ay) - (ax - tsOf(j)) * (avgY - ay)) * 0.5;
+      if (area > maxArea) {
+        maxArea = area;
+        maxAreaPoint = j;
+      }
+    }
+    sampled.push(rows[maxAreaPoint]);
+    a = maxAreaPoint;
   }
-  return out;
+
+  sampled.push(rows[n - 1]);
+  return sampled;
 }
 
 export default function Dashboard() {
@@ -191,7 +220,7 @@ export default function Dashboard() {
       )
       .subscribe();
 
-    // Flush buffered samples ~5x/sec. Each flush is ONE setState, so the
+    // Flush buffered samples ~4x/sec. Each flush is ONE setState, so the
     // graph redraws smoothly without re-rendering per inserted row.
     const flush = setInterval(() => {
       const batch = pendingRef.current;
@@ -217,7 +246,7 @@ export default function Dashboard() {
         roll: latest.roll,
         pitch: latest.pitch,
       }));
-    }, 200);
+    }, 250);
 
     return () => {
       mounted = false;
@@ -264,11 +293,11 @@ export default function Dashboard() {
     };
   }, [windowSec]);
 
-  // Render-decimate to ≤2000 points (defends paint cost) and memoize; the
+  // Render-decimate to ≤1200 points (defends paint cost) and memoize; the
   // X-axis uses numeric ts (recharts `scale="time"`) so there's no per-point
   // toLocaleTimeString work on every render.
   const chartData = useMemo(
-    () => decimateForRender(history, 2000),
+    () => decimateForRender(history, 1200),
     [history]
   );
 
@@ -399,10 +428,10 @@ export default function Dashboard() {
                 labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Line type="monotone" dataKey="pga_c" stroke="#ef4444" dot={false} name="PGA" />
-              <Line type="monotone" dataKey="sigma_f" stroke="#3b82f6" dot={false} name="Sigma (fused)" />
-              <Line type="monotone" dataKey="sigma_a" stroke="#22c55e" dot={false} name="Sigma (ADXL)" />
-              <Line type="monotone" dataKey="sigma_m" stroke="#f59e0b" dot={false} name="Sigma (MPU)" />
+              <Line type="monotone" dataKey="pga_c" stroke="#ef4444" dot={false} isAnimationActive={false} name="PGA" />
+              <Line type="monotone" dataKey="sigma_f" stroke="#3b82f6" dot={false} isAnimationActive={false} name="Sigma (fused)" />
+              <Line type="monotone" dataKey="sigma_a" stroke="#22c55e" dot={false} isAnimationActive={false} name="Sigma (ADXL)" />
+              <Line type="monotone" dataKey="sigma_m" stroke="#f59e0b" dot={false} isAnimationActive={false} name="Sigma (MPU)" />
             </LineChart>
           </ResponsiveContainer>
         ) : (
@@ -431,8 +460,8 @@ export default function Dashboard() {
                 labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Line type="monotone" dataKey="roll" stroke="#a855f7" dot={false} name="Roll" />
-              <Line type="monotone" dataKey="pitch" stroke="#06b6d4" dot={false} name="Pitch" />
+              <Line type="monotone" dataKey="roll" stroke="#a855f7" dot={false} isAnimationActive={false} name="Roll" />
+              <Line type="monotone" dataKey="pitch" stroke="#06b6d4" dot={false} isAnimationActive={false} name="Pitch" />
             </LineChart>
           </ResponsiveContainer>
         ) : (
