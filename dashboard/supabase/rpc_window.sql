@@ -66,7 +66,7 @@ BEGIN
   UNION ALL
   SELECT h.node_id, h.ts, h.pga_c, h.sigma_f, h.sigma_a, h.sigma_m, h.snr_db, h.roll, h.pitch
   FROM hi h
-  ORDER BY ts ASC;
+  ORDER BY 2 ASC;
 END;
 $$;
 
