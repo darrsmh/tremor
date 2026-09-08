@@ -1,9 +1,21 @@
 // ================================================================
-//  net.h — HTTPS POST helpers (fresh client per request)
+//  net.h - HTTPS POST helpers over a persistent TLS connection
 //
-//  ESP32 WiFiClientSecure leaves stale TLS state when reused
-//  across requests — http.begin() fails with code -1.
-//  Creating a fresh client each time is the only reliable approach.
+//  A fresh TLS handshake per POST cost 2-5 s on the ESP32 (RSA-2048
+//  server chain), throttling uploads to one ~100-sample batch every
+//  3-6 s (~30 rows/s instead of the sampled 200 Hz). The dashboard
+//  then advances in bursts with a growing right-edge gap (choppy +
+//  cutoff).
+//
+//  The connection is now PERSISTENT: one WiFiClientSecure stays
+//  connected (HTTP/1.1 keep-alive) and each request only pays the
+//  write round-trip (~100-300 ms), restoring the 500 ms batch
+//  cadence. A FRESH HTTPClient is still created per request -
+//  reusing the HTTPClient object across requests is what previously
+//  failed with begin() == -1 (stale response state), not the socket
+//  itself. Any transport failure tears the connection down and the
+//  next POST transparently falls back to a full handshake, so the
+//  worst case equals the old fresh-client behavior.
 //  Mutex guards concurrent access from alert + heartbeat tasks.
 // ================================================================
 
@@ -13,7 +25,7 @@
 #include <freertos/semphr.h>
 
 // TLS verification: embed the GTS Root R1 CA (tls_certs.h) and verify the
-// server certificate on every handshake, so a MITM can't present a forged
+// server certificate on every handshake, so a MITM cannot present a forged
 // cert to steal X-Api-Key. Define TLS_INSECURE=1 in secrets.h to fall back
 // to setInsecure() for lab/dev only.
 #include "tls_certs.h"
@@ -28,21 +40,26 @@
 #define API_KEY ""
 #endif
 
-// HTTPS read/connect timeout. A single POST now carries up to 200 samples
-// (1 s @ 200 Hz) into Supabase, plus an occasional Vercel edge cold start.
-// 8 s was too short: a slow server round-trip returned HTTPC_ERROR_READ_TIMEOUT
-// (-11) and dropped the whole batch. 20 s absorbs cold starts while the 1 Hz
-// upload cadence still bounds how long we wait per request.
+// HTTPS read/connect timeout. A single POST carries up to 100 samples into
+// Supabase, plus an occasional Vercel edge cold start. 8 s was too short: a
+// slow server round-trip returned HTTPC_ERROR_READ_TIMEOUT (-11) and dropped
+// the whole batch. 20 s absorbs cold starts while the 500 ms upload cadence
+// still bounds how long we wait per request.
 #define NET_TIMEOUT_MS 20000
 
 static SemaphoreHandle_t g_netMutex = nullptr;
+
+// Persistent TLS connection state. The socket stays open between POSTs;
+// g_tlsUp tracks whether we BELIEVE it is up (re-verified via connected()).
+static WiFiClientSecure g_tlsClient;
+static bool g_tlsUp = false;
 
 inline void netInit() {
     g_netMutex = xSemaphoreCreateMutex();
 }
 
-// Configure a fresh TLS session: verify against the embedded CA root unless
-// TLS_INSECURE is explicitly enabled in secrets.h.
+// Configure TLS: verify against the embedded CA root unless TLS_INSECURE
+// is explicitly enabled in secrets.h.
 static inline void _configTls(WiFiClientSecure& client) {
 #if TLS_INSECURE
     client.setInsecure();
@@ -50,6 +67,29 @@ static inline void _configTls(WiFiClientSecure& client) {
     client.setCACert(TLS_CA_ROOT_PEM);
 #endif
     client.setTimeout(NET_TIMEOUT_MS);
+}
+
+// Tear the persistent connection down (next POST pays a full handshake).
+static void _tlsDown() {
+    g_tlsClient.stop();
+    g_tlsUp = false;
+}
+
+// Make sure the persistent TLS connection is up, (re)connecting if needed.
+static bool _tlsEnsure(const String& apiHost) {
+    if (g_tlsUp && g_tlsClient.connected()) return true;
+    _tlsDown();
+    _configTls(g_tlsClient);
+    if (!g_tlsClient.connect(apiHost.c_str(), 443)) {
+        Serial.printf("[NET] TLS connect failed to %s freeHeap=%d maxAlloc=%d\n",
+                      apiHost.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        _tlsDown();
+        return false;
+    }
+    g_tlsUp = true;
+    Serial.printf("[NET] TLS session established to %s freeHeap=%d\n",
+                  apiHost.c_str(), ESP.getFreeHeap());
+    return true;
 }
 
 static char dbgResp[1024];
@@ -78,98 +118,20 @@ static String _extractHost() {
     return h;
 }
 
-static int _httpsPost(const char* path, const String& body) {
-    if (WiFi.status() != WL_CONNECTED) return -99;
-
-    if (g_netMutex) xSemaphoreTake(g_netMutex, portMAX_DELAY);
-
+// One request over the persistent connection (fresh HTTPClient per call).
+// Retries are handled by the caller; a transport failure (code < 0) here
+// always tears the connection down so the next attempt re-handshakes.
+static int _httpsPostOnce(const char* path, const char* body, size_t len) {
     String apiHost = _extractHost();
 
-    WiFiClientSecure client;
-    _configTls(client);
+    if (!_tlsEnsure(apiHost)) return -1;
 
     HTTPClient http;
     http.setTimeout(NET_TIMEOUT_MS);
+    http.setReuse(true);
 
-    if (!http.begin(client, apiHost, (uint16_t)443, String(path), true)) {
-        Serial.printf("[NET] begin() failed: %s freeHeap=%d\n",
-                      apiHost.c_str(), ESP.getFreeHeap());
-        http.end();
-        client.stop();
-        if (g_netMutex) xSemaphoreGive(g_netMutex);
-        delay(200);
-        if (g_netMutex) xSemaphoreTake(g_netMutex, portMAX_DELAY);
-
-        WiFiClientSecure retryClient;
-        _configTls(retryClient);
-        HTTPClient http2;
-        http2.setTimeout(NET_TIMEOUT_MS);
-
-        if (!http2.begin(retryClient, apiHost, (uint16_t)443, String(path), true)) {
-            Serial.printf("[NET] begin() failed (2nd try): %s freeHeap=%d\n",
-                          apiHost.c_str(), ESP.getFreeHeap());
-            http2.end();
-            if (g_netMutex) xSemaphoreGive(g_netMutex);
-            return -1;
-        }
-
-        http2.addHeader("Content-Type", "application/json");
-        http2.addHeader("X-Api-Key",    API_KEY);
-
-        int code = http2.POST(body);
-        if (code < 0) {
-            Serial.printf("[NET] POST error %d (%s) freeHeap=%d maxAlloc=%d bodyLen=%u\n", code,
-                          code == -1 ? "begin/TLS failed" : http2.errorToString(code).c_str(),
-                          ESP.getFreeHeap(), ESP.getMaxAllocHeap(), body.length());
-        } else if (code >= 400) {
-            _dumpResp(http2, code, body.length(), path);
-        }
-
-        http2.end();
-        retryClient.stop();
-        if (g_netMutex) xSemaphoreGive(g_netMutex);
-        return code;
-    }
-
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Api-Key",    API_KEY);
-
-    int code = http.POST(body);
-    if (code < 0) {
-        Serial.printf("[NET] POST error %d (%s) freeHeap=%d maxAlloc=%d bodyLen=%u\n", code,
-                      code == -1 ? "begin/TLS failed" : http.errorToString(code).c_str(),
-                      ESP.getFreeHeap(), ESP.getMaxAllocHeap(), body.length());
-    } else if (code >= 400) {
-        _dumpResp(http, code, body.length(), path);
-    }
-
-    http.end();
-    client.stop();
-    if (g_netMutex) xSemaphoreGive(g_netMutex);
-    return code;
-}
-
-// ── Raw-buffer (byte-array) transport ────────────────────────────────
-// Same as _httpsPost(String) but takes a static char buffer + length so the
-// payload never occupies DRAM heap while the mbedTLS handshake runs. Without
-// this the ~25KB body leaves ssl_setup() with -32512 (MBEDTLS_ERR_SSL_ALLOC_FAILED).
-static int _httpsPost(const char* path, const char* body, size_t len) {
-    if (WiFi.status() != WL_CONNECTED) return -99;
-
-    if (g_netMutex) xSemaphoreTake(g_netMutex, portMAX_DELAY);
-
-    String apiHost = _extractHost();
-
-    WiFiClientSecure client;
-    _configTls(client);
-
-    HTTPClient http;
-    http.setTimeout(NET_TIMEOUT_MS);
-
-    if (!http.begin(client, apiHost, (uint16_t)443, String(path), true)) {
-        http.end();
-        client.stop();
-        if (g_netMutex) xSemaphoreGive(g_netMutex);
+    if (!http.begin(g_tlsClient, apiHost, (uint16_t)443, String(path), true)) {
+        _tlsDown();
         return -1;
     }
 
@@ -181,7 +143,9 @@ static int _httpsPost(const char* path, const char* body, size_t len) {
         Serial.printf("[NET] POST error %d (%s) freeHeap=%d maxAlloc=%d bodyLen=%u\n", code,
                       code == -1 ? "begin/TLS failed" : http.errorToString(code).c_str(),
                       ESP.getFreeHeap(), ESP.getMaxAllocHeap(), (unsigned)len);
+        _tlsDown();
     } else if (code >= 400) {
+        // Application-level failure - the transport is fine, keep it up.
         _dumpResp(http, code, len, path);
         int dbg = len < 300 ? len : 300;
         char dbgBody[320];
@@ -199,24 +163,41 @@ static int _httpsPost(const char* path, const char* body, size_t len) {
         }
     }
 
+    // Keeps the TLS socket open when the server allows keep-alive; the
+    // available()>0 flush inside disconnect() also drains any unread body.
     http.end();
-    client.stop();
+    g_tlsUp = g_tlsClient.connected();
+    return code;
+}
+
+static int _httpsPost(const char* path, const char* body, size_t len) {
+    if (WiFi.status() != WL_CONNECTED) return -99;
+
+    if (g_netMutex) xSemaphoreTake(g_netMutex, portMAX_DELAY);
+
+    int code = _httpsPostOnce(path, body, len);
+    if (code < 0) {
+        // One transparent reconnect-and-retry: the usual cause is the server
+        // having closed an idle keep-alive socket, which only surfaces as a
+        // failed write. Never retried for HTTP 4xx/5xx - those came back fine.
+        code = _httpsPostOnce(path, body, len);
+    }
+
     if (g_netMutex) xSemaphoreGive(g_netMutex);
     return code;
 }
 
-// taskWiFiUpload — calls from single task, mutex still protects shared WiFiClientSecure internals
-inline int netIngestPost(const String& body) {
-    return _httpsPost("/api/ingest", body);
-}
-
-// Raw-buffer POST. The body lives in a static BSS buffer (not heap) so TLS keeps
-// maxAlloc for its own ~32KB contiguous handshake buffers.
+// taskWiFiUpload - single-task caller; the mutex still guards the shared
+// persistent client against the alert + heartbeat tasks.
 inline int netIngestPost(const char* body, size_t len) {
     return _httpsPost("/api/ingest", body, len);
 }
 
-// taskAlert + taskHeartbeat — mutex guarded
+inline int netIngestPost(const String& body) {
+    return _httpsPost("/api/ingest", body.c_str(), body.length());
+}
+
+// taskAlert + taskHeartbeat - mutex guarded
 inline int netAlertPost(const char* path, const String& body) {
-    return _httpsPost(path, body);
+    return _httpsPost(path, body.c_str(), body.length());
 }
