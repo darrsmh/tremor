@@ -91,12 +91,19 @@ ALTER PUBLICATION supabase_realtime ADD TABLE alerts;
 -- Trim by insertion order (id DESC), NOT sensor ts: a node that loses NTP
 -- sync can report boot-relative ts (tiny values) and would otherwise have
 -- every new row treated as "oldest" and deleted on insert.
+--
+-- Trigger must stay O(fast): the old `DELETE WHERE id NOT IN (SELECT ...)`
+-- full-scanned the table on EVERY insert and exceeded Postgres's statement
+-- timeout at ~155k rows, rolling back every ingest (HTTP 500, frozen graph)
+-- while the cheap live_state upsert kept succeeding. Use an index range over
+-- the PK instead: when the table is under the cap, LIMIT 1 OFFSET 200000 is
+-- empty so the DELETE removes nothing and costs almost nothing.
 -- =============================================================
 CREATE OR REPLACE FUNCTION trim_samples() RETURNS trigger AS $$
 BEGIN
   DELETE FROM samples
-  WHERE id NOT IN (
-    SELECT id FROM samples ORDER BY id DESC LIMIT 200000
+  WHERE id <= (
+    SELECT id FROM samples ORDER BY id DESC LIMIT 1 OFFSET 200000
   );
   RETURN NULL;
 END;
