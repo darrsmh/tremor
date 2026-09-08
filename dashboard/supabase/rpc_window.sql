@@ -31,7 +31,7 @@ BEGIN
 
   RETURN QUERY
   WITH filtered AS (
-    SELECT s.node_id, s.ts, s.pga_c, s.sigma_f, s.sigma_a, s.sigma_m,
+    SELECT s.id, s.node_id, s.ts, s.pga_c, s.sigma_f, s.sigma_a, s.sigma_m,
            s.snr_db, s.roll, s.pitch
     FROM samples s
     WHERE s.node_id = node_id_param
