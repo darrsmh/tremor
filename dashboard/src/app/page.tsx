@@ -418,8 +418,7 @@ export default function Dashboard() {
                 type="number"
                 scale="time"
                 domain={["dataMin", "dataMax"]}
-                tickFormatter={fmtTimeTick}
-                tick={{ fontSize: 11, fill: "#666" }}
+                tick={false}
               />
               <YAxis tick={{ fontSize: 11, fill: "#666" }} />
               <Tooltip
@@ -450,8 +449,7 @@ export default function Dashboard() {
                 type="number"
                 scale="time"
                 domain={["dataMin", "dataMax"]}
-                tickFormatter={fmtTimeTick}
-                tick={{ fontSize: 11, fill: "#666" }}
+                tick={false}
               />
               <YAxis tick={{ fontSize: 11, fill: "#666" }} />
               <Tooltip
