@@ -165,6 +165,9 @@ export default function Dashboard() {
   // second so the charts don't re-render on every single insert (~200/sec).
   const pendingRef = useRef<Sample[]>([]);
   const windowSecRef = useRef(30);
+  // Newest-sample anchor for the data-clock X axis (see dataNow below):
+  // { device ts of the newest sample, Date.now() when it was observed }.
+  const lastDataRef = useRef<{ ts: number; at: number } | null>(null);
 
   // Wall-clock heartbeat for the chart X-axis. The old axis used
   // domain={["dataMin","dataMax"]}, so the graph only advanced when new rows
@@ -235,6 +238,10 @@ export default function Dashboard() {
       if (!batch.length) return;
       pendingRef.current = [];
       const latest = batch[batch.length - 1];
+      // Track the newest sample for the data-clock X axis (see dataNow).
+      if (latest.ts > (lastDataRef.current?.ts ?? Number.NEGATIVE_INFINITY)) {
+        lastDataRef.current = { ts: latest.ts, at: Date.now() };
+      }
       // Append realtime rows in all window modes — the periodic poll will
       // replace with properly decimated data; raw rows between polls are
       // negligible and keep the graph visibly streaming.
@@ -292,6 +299,11 @@ export default function Dashboard() {
         // a server snapshot when it actually contains rows, and let the
         // realtime flush keep appending raw rows the rest of the time.
         if (clean.length > 0) {
+          // Track the newest sample for the data-clock X axis (see dataNow).
+          const newestClean = clean.reduce((m, x) => (x.ts > m ? x.ts : m), Number.NEGATIVE_INFINITY);
+          if (newestClean > (lastDataRef.current?.ts ?? Number.NEGATIVE_INFINITY)) {
+            lastDataRef.current = { ts: newestClean, at: Date.now() };
+          }
           // Union-merge instead of overwrite: rows that arrived via Realtime
           // while this poll was in flight would otherwise be chopped off the
           // tail, making the graph jump backwards on every slow poll.
@@ -319,27 +331,38 @@ export default function Dashboard() {
     };
   }, [windowSec]);
 
-  // Wall-clock X domain: [now - window, now]. Driven by the 100ms heartbeat
-  // so the strip-chart keeps scrolling in real time even when samples are
-  // delayed in transit; recharts clips anything drawn past the right edge.
+  // Data-clock now: the newest sample DEVICE timestamp extrapolated forward
+  // by real elapsed time (a Date.now() difference, so any PC clock offset
+  // cancels out). The device clock runs tens of seconds behind server real
+  // time (measured: server receive time minus device ts was 20-55s), so
+  // anchoring the window to Date.now() pushed the newest samples outside the
+  // viewport and only a portion of the graph showed. Anchoring to the data
+  // timeline keeps the window full while data streams and keeps scrolling
+  // smoothly between batches; a gap longer than the window empties the chart
+  // (truthful) until data resumes and it re-anchors.
+  const dataNow = lastDataRef.current
+    ? lastDataRef.current.ts + Math.max(nowTick - lastDataRef.current.at, 0)
+    : nowTick;
+
+  // X window: [dataNow - window, dataNow] on the device own timeline.
   const xDomain = useMemo<[number, number]>(
-    () => [nowTick - windowSec * 1000, nowTick],
-    [nowTick, windowSec]
+    () => [dataNow - windowSec * 1000, dataNow],
+    [dataNow, windowSec]
   );
 
-  // Keep only samples inside the visible wall-clock window (so the Y-axis
+  // Keep only samples inside the visible data-clock window (so the Y-axis
   // scales to what is actually visible), then decimate into stable,
   // time-aligned min/max buckets => <=~1200 plotted points. Both passes are a
   // single cheap O(n) sweep with NO point reshuffling between ticks.
   // Delayed batches render at their true acquisition timestamps, so a
   // send-gap fills in honestly instead of being bridged with fabricated data.
   const chartData = useMemo(() => {
-    const windowStart = nowTick - windowSec * 1000;
+    const windowStart = dataNow - windowSec * 1000;
     return decimateForRender(
-      history.filter((d) => d.ts >= windowStart && d.ts <= nowTick),
+      history.filter((d) => d.ts >= windowStart && d.ts <= dataNow),
       (windowSec * 1000) / 600
     );
-  }, [history, nowTick, windowSec]);
+  }, [history, dataNow, windowSec]);
 
   // Online if the latest live timestamp is recent, else fall back to the
   // newest history sample. Averaged against server ingestion time so a stale
