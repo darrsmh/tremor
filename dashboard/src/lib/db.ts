@@ -1,5 +1,7 @@
 import { createSupabaseServer } from "./supabase-server";
 
+export const DEFAULT_NODE_ID = "ADXL345-01";
+
 const SAMPLE_COLUMNS =
   "node_id, ts, pga_c, sigma_f, sigma_a, sigma_m, snr_db, roll, pitch";
 
@@ -14,7 +16,7 @@ export async function updateLive(data: Record<string, unknown>) {
   const { error } = await sb()
     .from("live_state")
     .upsert(
-      { node_id: node_id ?? "ADXL345-01", ...fields, updated_at: new Date().toISOString() },
+      { node_id: node_id ?? DEFAULT_NODE_ID, ...fields, updated_at: new Date().toISOString() },
       { onConflict: "node_id" }
     );
   if (error) console.error("[db] live_state upsert failed:", error.message);
@@ -24,7 +26,7 @@ export async function getLive() {
   const { data, error } = await sb()
     .from("live_state")
     .select("*")
-    .eq("node_id", "ADXL345-01");
+    .eq("node_id", DEFAULT_NODE_ID);
   if (error) console.error("[db] live_state query failed:", error.message);
   return (data?.[0] ?? {}) as Record<string, unknown>;
 }
@@ -36,7 +38,7 @@ export async function pushSamples(samples: object[]) {
   const rows = samples.map((s) => {
     const r = s as Record<string, unknown>;
     return {
-      node_id: "ADXL345-01",
+      node_id: DEFAULT_NODE_ID,
       ts: r.ts,
       pga_c: r.pga_c,
       sigma_f: r.sigma_f,
@@ -78,7 +80,7 @@ export async function getSamples(count = 200) {
 export async function getSamplesWindowed(count = 6000, windowSeconds = 30) {
   const target = Math.min(count, 6000);
   const { data, error } = await sb().rpc("get_samples_window", {
-    node_id_param: "ADXL345-01",
+    node_id_param: DEFAULT_NODE_ID,
     window_seconds: windowSeconds,
     target_points: target,
   });

@@ -1,7 +1,7 @@
 export const runtime = "edge";
 
 import { NextRequest, NextResponse } from "next/server";
-import { pushAlert, updateLive, getAlerts } from "@/lib/db";
+import { pushAlert, updateLive, getAlerts, DEFAULT_NODE_ID } from "@/lib/db";
 
 function verifyKey(req: NextRequest) {
   return req.headers.get("x-api-key") === process.env.API_KEY;
@@ -23,7 +23,7 @@ export async function POST(req: NextRequest) {
   await Promise.all([
     pushAlert(body),
     updateLive({
-      node_id:        body.node_id ?? "ADXL345-01",
+      node_id:        body.node_id ?? DEFAULT_NODE_ID,
       last_alert_pga: body.pga,
       last_alert_ts:  body.ts_ms,
       last_alert_snr: body.snr_db,

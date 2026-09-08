@@ -75,10 +75,14 @@
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
+#define NODE_ID       "ADXL345-01"
 #define WIFI_SSID     ""
 #define WIFI_PASS     ""
 #define API_BASE_URL  ""
 #define API_KEY       ""
+#endif
+#ifndef NODE_ID
+#define NODE_ID "ADXL345-01"
 #endif
 
 #include "net.h"
@@ -650,6 +654,7 @@ static void taskWiFiUpload(void*) {
 
     uint32_t lastUpload = 0, lastWifi = 0;
     static int consecutiveFailures = 0;
+    bool epochArmedLast = false;
 
     // Snapshot NOT taken: the ring is read directly because sTail only advances
     // on a successful POST, so ring[tail..tail+cnt) is stable while serializing.
@@ -658,6 +663,14 @@ static void taskWiFiUpload(void*) {
     static char postBuf[64 + MAX_BATCH * 160];
 
     while (true) {
+        // Retry NTP every 10 s until the epoch offset is armed. Until it is,
+        // uploads are held (see below), so booting with a slow/failed sync must
+        // not strand the node silently.
+        if (g_epochOffsetMs == 0 && millis() - g_lastNtpMs > 10000) {
+            syncNTP();
+            g_lastNtpMs = millis();
+        }
+
         if (millis() - lastWifi > 30000) {
             lastWifi = millis();
             wifiReconnect();
@@ -678,7 +691,22 @@ static void taskWiFiUpload(void*) {
         // cutting HTTPS request volume vs per-100ms while keeping each payload
         // small enough (~12KB) that the TLS write completes even on a flaky
         // link. Realtime still streams each inserted batch to the page.
-        if (millis() - lastUpload >= 500 && WiFi.status() == WL_CONNECTED) {
+        //
+        // Gate on NTP being armed: until the epoch offset exists, the ring is
+        // full of boot-relative timestamps (~millis since boot, tiny values)
+        // that the dashboard rejects as garbage. Rather than upload noise, the
+        // task waits; the moment the clock arms, pre-sync ring contents are
+        // dropped in one shot (sTail = sHead) so no wrong-stamped sample ever
+        // reaches the server. The lost ~5-10 s overlaps the 60 s stationary
+        // calibration phase, so no usable data is discarded.
+        bool epochArmed = (g_epochOffsetMs != 0);
+        if (epochArmed && !epochArmedLast) {
+            epochArmedLast = true;
+            sTail = sHead;
+            Serial.println("[WiFi] NTP armed — discarding pre-sync ring samples");
+        }
+
+        if (epochArmed && millis() - lastUpload >= 500 && WiFi.status() == WL_CONNECTED) {
             lastUpload = millis();
 
             // Count samples available WITHOUT advancing tail. The ring is read
@@ -703,7 +731,7 @@ static void taskWiFiUpload(void*) {
                 int postLen = 0;
                 {
                     JsonDocument doc;
-                    doc["node_id"]     = "ADXL345-01";
+                    doc["node_id"]     = NODE_ID;
                     doc["fw"]          = "2.0.0";
                     doc["threshold_g"] = DETECT_THRESHOLD_G;
                     doc["cf_alpha"]    = CF_ALPHA;
@@ -798,8 +826,8 @@ static void taskAlert(void*) {
 
         // ── Immediate WiFi POST ──────────────────────────────────
         if (WiFi.status() == WL_CONNECTED) {
-            StaticJsonDocument<512> doc;
-            doc["node_id"]             = "ADXL345-01";
+            JsonDocument doc;
+            doc["node_id"]             = NODE_ID;
             doc["event_type"]          = "seismic_detection";
             doc["pga_mgal"]            = (int)(al.pga * 1000.0f);
             doc["pga"]                 = serialized(String(al.pga,        5));
@@ -848,8 +876,8 @@ static void taskHeartbeat(void*) {
             lastBeat = millis();
             // Heartbeat POST
             if (WiFi.status() == WL_CONNECTED) {
-                StaticJsonDocument<256> doc;
-                doc["node_id"]   = "ADXL345-01";
+                JsonDocument doc;
+                doc["node_id"]   = NODE_ID;
                 doc["ts_ms"]     = (uint64_t)(g_epochOffsetMs + (int64_t)millis());
                 doc["status"]    = "alive";
                 doc["rssi_dbm"]  = WiFi.RSSI();

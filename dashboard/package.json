@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --test \"test/*.test.mjs\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.4",

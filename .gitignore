@@ -1,6 +1,8 @@
 .pio/
 .vscode/
 secrets.h
+compile_commands.json
+backup_before_edge_tls/
 *.bin
 *.elf
 *.map

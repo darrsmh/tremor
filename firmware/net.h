@@ -12,6 +12,15 @@
 #include <HTTPClient.h>
 #include <freertos/semphr.h>
 
+// TLS verification: embed the GTS Root R1 CA (tls_certs.h) and verify the
+// server certificate on every handshake, so a MITM can't present a forged
+// cert to steal X-Api-Key. Define TLS_INSECURE=1 in secrets.h to fall back
+// to setInsecure() for lab/dev only.
+#include "tls_certs.h"
+#ifndef TLS_INSECURE
+#define TLS_INSECURE 0
+#endif
+
 #ifndef API_BASE_URL
 #define API_BASE_URL ""
 #endif
@@ -30,6 +39,17 @@ static SemaphoreHandle_t g_netMutex = nullptr;
 
 inline void netInit() {
     g_netMutex = xSemaphoreCreateMutex();
+}
+
+// Configure a fresh TLS session: verify against the embedded CA root unless
+// TLS_INSECURE is explicitly enabled in secrets.h.
+static inline void _configTls(WiFiClientSecure& client) {
+#if TLS_INSECURE
+    client.setInsecure();
+#else
+    client.setCACert(TLS_CA_ROOT_PEM);
+#endif
+    client.setTimeout(NET_TIMEOUT_MS);
 }
 
 static char dbgResp[1024];
@@ -66,8 +86,7 @@ static int _httpsPost(const char* path, const String& body) {
     String apiHost = _extractHost();
 
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(NET_TIMEOUT_MS);
+    _configTls(client);
 
     HTTPClient http;
     http.setTimeout(NET_TIMEOUT_MS);
@@ -82,8 +101,7 @@ static int _httpsPost(const char* path, const String& body) {
         if (g_netMutex) xSemaphoreTake(g_netMutex, portMAX_DELAY);
 
         WiFiClientSecure retryClient;
-        retryClient.setInsecure();
-        retryClient.setTimeout(NET_TIMEOUT_MS);
+        _configTls(retryClient);
         HTTPClient http2;
         http2.setTimeout(NET_TIMEOUT_MS);
 
@@ -143,8 +161,7 @@ static int _httpsPost(const char* path, const char* body, size_t len) {
     String apiHost = _extractHost();
 
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(NET_TIMEOUT_MS);
+    _configTls(client);
 
     HTTPClient http;
     http.setTimeout(NET_TIMEOUT_MS);

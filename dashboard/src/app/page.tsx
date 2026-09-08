@@ -12,6 +12,17 @@ import {
   Legend,
 } from "recharts";
 import { createSupabaseBrowser } from "@/lib/supabase-client";
+import {
+  type Sample,
+  fmt,
+  epochMs,
+  ago,
+  fmtTimeTick,
+  normalizeSample,
+  decimateForRender,
+  breakGaps,
+  computeGapMs,
+} from "@/lib/chart-logic";
 
 interface Live {
   node_id?: string;
@@ -26,18 +37,7 @@ interface Live {
   pitch?: number;
   last_alert_pga?: number;
   last_alert_ts?: number;
-}
-
-interface Sample {
-  node_id?: string;
-  ts: number;
-  pga_c: number;
-  sigma_f: number;
-  sigma_a: number;
-  sigma_m: number;
-  snr_db: number;
-  roll: number;
-  pitch: number;
+  last_alert_snr?: number;
 }
 
 interface Alert {
@@ -46,113 +46,6 @@ interface Alert {
   snr_db: number;
   sigma_fused: number;
   created_at?: string;
-}
-
-function fmt(n: unknown, d = 5) {
-  const num = typeof n === "string" ? parseFloat(n) : Number(n);
-  if (num === undefined || num === null || Number.isNaN(num)) return "--";
-  return num.toFixed(d);
-}
-
-function epochMs(n: unknown): number {
-  const t = typeof n === "string" ? Date.parse(n) : Number(n);
-  if (!Number.isFinite(t)) return NaN;
-  // Sanity-check: only accept plausible epoch-ms timestamps (2000-02-01 .. 2037-12-31).
-  // This rejects device uptime in ms (small values) that would otherwise display
-  // as "~490,000 hours ago".
-  const lo = Date.UTC(2000, 1, 1);
-  const hi = Date.UTC(2038, 0, 1);
-  return t > lo && t < hi ? t : NaN;
-}
-
-function ago(ms: number) {
-  if (!Number.isFinite(ms)) return "--";
-  const s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 0) return "now";
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  return `${Math.floor(s / 3600)}h ago`;
-}
-
-// X-axis tick / tooltip label: epoch-ms → HH:MM:SS (Philippine time).
-function fmtTimeTick(v: unknown) {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 1000000000000) return "";
-  return new Date(n).toLocaleTimeString("en-US", {
-    timeZone: "Asia/Manila",
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-// Supabase Realtime serializes BIGINT columns (like `ts`) as JSON strings to
-// avoid precision loss > 2^53. Normalize them back to numbers so the chart
-// X-axis, `new Date(ts)`, and the online check all receive numeric ms.
-// Also reject implausible ts values (a ~1.78e15 row was observed in history —
-// garbage that pushed the X-axis to "year 56600" and broke the chart).
-function normalizeSample(row: Record<string, unknown>): Sample | null {
-  const toNum = (v: unknown) => (v === null || v === undefined || v === "" ? NaN : Number(v));
-  const ts = toNum(row.ts);
-  if (!Number.isFinite(ts) || ts < 1000000000000 || ts > 2000000000000) {
-    return null; // outside 2001..2033 epoch-ms — boot uptime / garbage, drop it
-  }
-  return {
-    node_id: (row.node_id as string) ?? undefined,
-    ts,
-    pga_c: toNum(row.pga_c),
-    sigma_f: toNum(row.sigma_f),
-    sigma_a: toNum(row.sigma_a),
-    sigma_m: toNum(row.sigma_m),
-    snr_db: toNum(row.snr_db),
-    roll: toNum(row.roll),
-    pitch: toNum(row.pitch),
-  };
-}
-
-// Stable render decimation: time-aligned min/max buckets. Rows are grouped by
-// floor(ts / bucketMs) and the min-PGA and max-PGA rows of each bucket are
-// kept (<= 2 rows per bucket, so ~600 buckets => <=~1200 plotted points).
-// Bucket edges are pinned to ABSOLUTE epoch time -- not to row indexes -- so
-// the chosen points do NOT reshuffle as the window slides or old rows age
-// out. (The previous LTTB pass re-picked a different subset on every tick,
-// which visibly reshaped the whole polyline twice per second -- the
-// choppiness/flicker.) min+max preserves PGA spikes, matching what the
-// server-side get_samples_window RPC already returns for long windows.
-function decimateForRender(rows: Sample[], bucketMs: number): Sample[] {
-  const n = rows.length;
-  if (!(bucketMs > 0) || n === 0) return rows;
-
-  const lo = new Map<number, Sample>();
-  const hi = new Map<number, Sample>();
-  for (const r of rows) {
-    const b = Math.floor(r.ts / bucketMs);
-    const curLo = lo.get(b);
-    if (!curLo || r.pga_c < curLo.pga_c || (r.pga_c === curLo.pga_c && r.ts < curLo.ts)) {
-      lo.set(b, r);
-    }
-    const curHi = hi.get(b);
-    if (!curHi || r.pga_c > curHi.pga_c || (r.pga_c === curHi.pga_c && r.ts > curHi.ts)) {
-      hi.set(b, r);
-    }
-  }
-
-  const out: Sample[] = [];
-  const keys = [...lo.keys()].sort((a, b) => a - b);
-  for (const b of keys) {
-    const l = lo.get(b);
-    const h = hi.get(b);
-    if (!l || !h) continue;
-    if (l === h) {
-      out.push(l);
-    } else if (l.ts < h.ts) {
-      out.push(l, h);
-    } else {
-      out.push(h, l);
-    }
-  }
-  return out;
 }
 
 export default function Dashboard() {
@@ -338,10 +231,18 @@ export default function Dashboard() {
   // anchoring the window to Date.now() pushed the newest samples outside the
   // viewport and only a portion of the graph showed. Anchoring to the data
   // timeline keeps the window full while data streams and keeps scrolling
-  // smoothly between batches; a gap longer than the window empties the chart
-  // (truthful) until data resumes and it re-anchors.
+  // smoothly between batches.
+  //
+  // The extrapolation is CLAMPED (extrapLimitMs): Date.now() keeps growing
+  // during a stall or a backgrounded tab, so without a cap the axis would race
+  // ahead of the data and then yank backwards the moment samples resume. With
+  // the cap, the axis coasts up to extrapLimit past the newest sample and then
+  // holds a stable view (old data + flat stale tail) until fresh samples jump
+  // it forward again. lastDataRef.ts is only ever updated to a NEWER sample
+  // (forward-only), so dataNow never moves backwards.
+  const extrapLimitMs = Math.max(windowSec * 1000, 30000);
   const dataNow = lastDataRef.current
-    ? lastDataRef.current.ts + Math.max(nowTick - lastDataRef.current.at, 0)
+    ? lastDataRef.current.ts + Math.min(Math.max(nowTick - lastDataRef.current.at, 0), extrapLimitMs)
     : nowTick;
 
   // X window: [dataNow - window, dataNow] on the device own timeline.
@@ -356,12 +257,23 @@ export default function Dashboard() {
   // single cheap O(n) sweep with NO point reshuffling between ticks.
   // Delayed batches render at their true acquisition timestamps, so a
   // send-gap fills in honestly instead of being bridged with fabricated data.
+  //
+  // breakGaps then inserts null bridges wherever consecutive points are more
+  // than computeGapMs apart (a WiFi stall, reboot, or send pause), so recharts
+  // (connectNulls={false}) draws a TRUE gap instead of a straight line ramping
+  // across the missing data.
+  //
+  // Finally a synthetic row is stamped at dataNow carrying the newest visible
+  // sample's values: while the stream is live it's a harmless right-edge stub,
+  // and once data stops it becomes a flat "stale" tail that keeps the graph
+  // anchored and clearly showing NO new samples instead of blanking out.
   const chartData = useMemo(() => {
     const windowStart = dataNow - windowSec * 1000;
-    return decimateForRender(
-      history.filter((d) => d.ts >= windowStart && d.ts <= dataNow),
-      (windowSec * 1000) / 600
-    );
+    const bucketMs = (windowSec * 1000) / 600;
+    const filtered = history.filter((d) => d.ts >= windowStart && d.ts <= dataNow);
+    const broken = breakGaps(decimateForRender(filtered, bucketMs), computeGapMs(bucketMs));
+    const last = filtered[filtered.length - 1] ?? history[history.length - 1];
+    return last ? [...broken, { ...last, ts: dataNow }] : broken;
   }, [history, dataNow, windowSec]);
 
   // Online if the latest live timestamp is recent, else fall back to the
@@ -378,6 +290,12 @@ export default function Dashboard() {
       online = Date.now() - lastLiveTs < 60000;
     }
   }
+
+  // Pre-anchor boot state: before the very first sample anchors the data clock
+  // (via the initial history poll or the first realtime batch) there is nothing
+  // to draw, and rendering an empty chart against the browser-clock fallback
+  // just looks broken. Show a stable placeholder instead.
+  const awaitingFirst = !lastDataRef.current;
 
   return (
     <div className="dashboard">
@@ -490,14 +408,16 @@ export default function Dashboard() {
                 labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Line type="linear" dataKey="pga_c" stroke="#ef4444" dot={false} isAnimationActive={false} name="PGA" />
-              <Line type="linear" dataKey="sigma_f" stroke="#3b82f6" dot={false} isAnimationActive={false} name="Sigma (fused)" />
-              <Line type="linear" dataKey="sigma_a" stroke="#22c55e" dot={false} isAnimationActive={false} name="Sigma (ADXL)" />
-              <Line type="linear" dataKey="sigma_m" stroke="#f59e0b" dot={false} isAnimationActive={false} name="Sigma (MPU)" />
+              <Line type="linear" dataKey="pga_c" stroke="#ef4444" dot={false} isAnimationActive={false} connectNulls={false} name="PGA" />
+              <Line type="linear" dataKey="sigma_f" stroke="#3b82f6" dot={false} isAnimationActive={false} connectNulls={false} name="Sigma (fused)" />
+              <Line type="linear" dataKey="sigma_a" stroke="#22c55e" dot={false} isAnimationActive={false} connectNulls={false} name="Sigma (ADXL)" />
+              <Line type="linear" dataKey="sigma_m" stroke="#f59e0b" dot={false} isAnimationActive={false} connectNulls={false} name="Sigma (MPU)" />
             </LineChart>
           </ResponsiveContainer>
         ) : (
-          <div className="no-data">Waiting for data...</div>
+          <div className="no-data">
+            {awaitingFirst ? "Waiting for first samples..." : "Waiting for data..."}
+          </div>
         )}
       </div>
 
@@ -521,12 +441,14 @@ export default function Dashboard() {
                 labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Line type="linear" dataKey="roll" stroke="#a855f7" dot={false} isAnimationActive={false} name="Roll" />
-              <Line type="linear" dataKey="pitch" stroke="#06b6d4" dot={false} isAnimationActive={false} name="Pitch" />
+              <Line type="linear" dataKey="roll" stroke="#a855f7" dot={false} isAnimationActive={false} connectNulls={false} name="Roll" />
+              <Line type="linear" dataKey="pitch" stroke="#06b6d4" dot={false} isAnimationActive={false} connectNulls={false} name="Pitch" />
             </LineChart>
           </ResponsiveContainer>
         ) : (
-          <div className="no-data">Waiting for data...</div>
+          <div className="no-data">
+            {awaitingFirst ? "Waiting for first samples..." : "Waiting for data..."}
+          </div>
         )}
       </div>
 
