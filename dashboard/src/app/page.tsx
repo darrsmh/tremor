@@ -172,6 +172,18 @@ export default function Dashboard() {
   const pendingRef = useRef<Sample[]>([]);
   const windowSecRef = useRef(30);
 
+  // Wall-clock heartbeat for the chart X-axis. The old axis used
+  // domain={["dataMin","dataMax"]}, so the graph only advanced when new rows
+  // arrived: every upload delay (WiFi/TLS stall on the ESP32 -- expected on
+  // intermittent links) froze the chart flat until the next batch landed.
+  // Anchoring the axis to Date.now() makes the graph scroll continuously like
+  // a strip-chart recorder no matter when data actually arrives.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const heartbeat = setInterval(() => setNowTick(Date.now()), 500);
+    return () => clearInterval(heartbeat);
+  }, []);
+
   useEffect(() => {
     let mounted = true;
 
@@ -231,8 +243,14 @@ export default function Dashboard() {
       // replace with properly decimated data; raw rows between polls are
       // negligible and keep the graph visibly streaming.
       setHistory((prev) => {
+        // Window-aware cap: raw rows stream in at ~200 Hz, so a fixed
+        // 6000-row cap would evict the older decimated snapshot rows in the
+        // 2m/5m views, visibly emptying the left side of the chart between
+        // polls. Keep enough rows to cover the window with headroom; the
+        // render path decimates to <=1200 points anyway.
+        const cap = Math.min(Math.max(windowSecRef.current * 400, 6000), 20000);
         const next = [...prev, ...batch];
-        return next.length > 6000 ? next.slice(-6000) : next;
+        return next.length > cap ? next.slice(-cap) : next;
       });
       setLive((prev) => ({
         ...prev,
@@ -277,7 +295,19 @@ export default function Dashboard() {
         // chart on every 20s poll (the frozen-graph bug). Instead, only adopt
         // a server snapshot when it actually contains rows, and let the
         // realtime flush keep appending raw rows the rest of the time.
-        if (clean.length > 0) setHistory(clean);
+        if (clean.length > 0) {
+          // Union-merge instead of overwrite: rows that arrived via Realtime
+          // while this poll was in flight would otherwise be chopped off the
+          // tail, making the graph jump backwards on every slow poll.
+          setHistory((prev) => {
+            const cap = Math.min(Math.max(windowSec * 400, 6000), 20000);
+            const byTs = new Map<number, Sample>();
+            for (const p of prev) byTs.set(p.ts, p);
+            for (const c of clean) byTs.set(c.ts, c);
+            const merged = [...byTs.values()].sort((a, b) => a.ts - b.ts);
+            return merged.length > cap ? merged.slice(-cap) : merged;
+          });
+        }
       } catch {}
     };
     refresh();
@@ -293,13 +323,25 @@ export default function Dashboard() {
     };
   }, [windowSec]);
 
-  // Render-decimate to ≤1200 points (defends paint cost) and memoize; the
-  // X-axis uses numeric ts (recharts `scale="time"`) so there's no per-point
-  // toLocaleTimeString work on every render.
-  const chartData = useMemo(
-    () => decimateForRender(history, 1200),
-    [history]
+  // Wall-clock X domain: [now - window, now]. Driven by the 500ms heartbeat
+  // so the strip-chart keeps scrolling in real time even when samples are
+  // delayed in transit; recharts clips anything drawn past the right edge.
+  const xDomain = useMemo<[number, number]>(
+    () => [nowTick - windowSec * 1000, nowTick],
+    [nowTick, windowSec]
   );
+
+  // Keep only samples inside the visible wall-clock window, then
+  // render-decimate to <=1200 points (defends paint cost). Delayed batches
+  // render at their true acquisition timestamps, so a send-gap fills in
+  // honestly instead of being bridged with fabricated flat data.
+  const chartData = useMemo(() => {
+    const windowStart = nowTick - windowSec * 1000;
+    return decimateForRender(
+      history.filter((d) => d.ts >= windowStart && d.ts <= nowTick),
+      1200
+    );
+  }, [history, nowTick, windowSec]);
 
   // Online if the latest live timestamp is recent, else fall back to the
   // newest history sample. Averaged against server ingestion time so a stale
@@ -417,7 +459,7 @@ export default function Dashboard() {
                 dataKey="ts"
                 type="number"
                 scale="time"
-                domain={["dataMin", "dataMax"]}
+                domain={xDomain}
                 tick={false}
               />
               <YAxis tick={{ fontSize: 11, fill: "#666" }} />
@@ -448,7 +490,7 @@ export default function Dashboard() {
                 dataKey="ts"
                 type="number"
                 scale="time"
-                domain={["dataMin", "dataMax"]}
+                domain={xDomain}
                 tick={false}
               />
               <YAxis tick={{ fontSize: 11, fill: "#666" }} />
