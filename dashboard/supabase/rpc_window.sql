@@ -48,16 +48,18 @@ BEGIN
     FROM filtered f CROSS JOIN counts
   ),
   lo AS (
-    SELECT DISTINCT ON (bucket)
-           bucket, node_id, ts, pga_c, sigma_f, sigma_a, sigma_m, snr_db, roll, pitch
-    FROM numbered
-    ORDER BY bucket, pga_c ASC, ts ASC
+    SELECT DISTINCT ON (n.bucket)
+           n.bucket, n.node_id, n.ts, n.pga_c, n.sigma_f, n.sigma_a, n.sigma_m,
+           n.snr_db, n.roll, n.pitch
+    FROM numbered n
+    ORDER BY n.bucket, n.pga_c ASC, n.ts ASC
   ),
   hi AS (
-    SELECT DISTINCT ON (bucket)
-           bucket, node_id, ts, pga_c, sigma_f, sigma_a, sigma_m, snr_db, roll, pitch
-    FROM numbered
-    ORDER BY bucket, pga_c DESC, ts DESC
+    SELECT DISTINCT ON (n.bucket)
+           n.bucket, n.node_id, n.ts, n.pga_c, n.sigma_f, n.sigma_a, n.sigma_m,
+           n.snr_db, n.roll, n.pitch
+    FROM numbered n
+    ORDER BY n.bucket, n.pga_c DESC, n.ts DESC
   )
   SELECT node_id, ts, pga_c, sigma_f, sigma_a, sigma_m, snr_db, roll, pitch FROM lo
   UNION ALL
