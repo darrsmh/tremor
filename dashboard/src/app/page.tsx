@@ -111,54 +111,48 @@ function normalizeSample(row: Record<string, unknown>): Sample | null {
   };
 }
 
-// Largest-Triangle-Three-Buckets downsampling. Keeps points in temporal order
-// and preserves spikes while dropping to ~maxPoints, unlike min/max pairs
-// (which zigzag within each time slice and rendered as a jagged sawtooth) or
-// plain averaging (which smears spikes). Also lightens the SVG path so the
-// chart paints smoothly.
-function decimateForRender(rows: Sample[], threshold: number): Sample[] {
+// Stable render decimation: time-aligned min/max buckets. Rows are grouped by
+// floor(ts / bucketMs) and the min-PGA and max-PGA rows of each bucket are
+// kept (<= 2 rows per bucket, so ~600 buckets => <=~1200 plotted points).
+// Bucket edges are pinned to ABSOLUTE epoch time -- not to row indexes -- so
+// the chosen points do NOT reshuffle as the window slides or old rows age
+// out. (The previous LTTB pass re-picked a different subset on every tick,
+// which visibly reshaped the whole polyline twice per second -- the
+// choppiness/flicker.) min+max preserves PGA spikes, matching what the
+// server-side get_samples_window RPC already returns for long windows.
+function decimateForRender(rows: Sample[], bucketMs: number): Sample[] {
   const n = rows.length;
-  if (threshold <= 0 || threshold >= n) return rows;
-  const sampled: Sample[] = [];
-  const every = (n - 2) / (threshold - 2);
-  let a = 0;
-  sampled.push(rows[a]);
+  if (!(bucketMs > 0) || n === 0) return rows;
 
-  const tsOf = (i: number) => rows[i].ts;
-  const yOf = (i: number) => rows[i].pga_c;
-
-  for (let i = 0; i < threshold - 2; i++) {
-    const avgRangeStart = Math.floor((i + 1) * every) + 1;
-    const avgRangeEnd = Math.min(Math.floor((i + 2) * every) + 1, n);
-    let avgX = 0;
-    let avgY = 0;
-    const len = avgRangeEnd - avgRangeStart;
-    for (let j = avgRangeStart; j < avgRangeEnd; j++) {
-      avgX += tsOf(j);
-      avgY += yOf(j);
+  const lo = new Map<number, Sample>();
+  const hi = new Map<number, Sample>();
+  for (const r of rows) {
+    const b = Math.floor(r.ts / bucketMs);
+    const curLo = lo.get(b);
+    if (!curLo || r.pga_c < curLo.pga_c || (r.pga_c === curLo.pga_c && r.ts < curLo.ts)) {
+      lo.set(b, r);
     }
-    avgX /= len;
-    avgY /= len;
-
-    const rangeOffs = Math.max(Math.floor(i * every) + 1, 0);
-    const rangeTo = Math.max(Math.floor((i + 1) * every) + 1, 0);
-    const ax = tsOf(a);
-    const ay = yOf(a);
-    let maxArea = -1;
-    let maxAreaPoint = a;
-    for (let j = rangeOffs; j < rangeTo; j++) {
-      const area = Math.abs((ax - avgX) * (yOf(j) - ay) - (ax - tsOf(j)) * (avgY - ay)) * 0.5;
-      if (area > maxArea) {
-        maxArea = area;
-        maxAreaPoint = j;
-      }
+    const curHi = hi.get(b);
+    if (!curHi || r.pga_c > curHi.pga_c || (r.pga_c === curHi.pga_c && r.ts > curHi.ts)) {
+      hi.set(b, r);
     }
-    sampled.push(rows[maxAreaPoint]);
-    a = maxAreaPoint;
   }
 
-  sampled.push(rows[n - 1]);
-  return sampled;
+  const out: Sample[] = [];
+  const keys = [...lo.keys()].sort((a, b) => a - b);
+  for (const b of keys) {
+    const l = lo.get(b);
+    const h = hi.get(b);
+    if (!l || !h) continue;
+    if (l === h) {
+      out.push(l);
+    } else if (l.ts < h.ts) {
+      out.push(l, h);
+    } else {
+      out.push(h, l);
+    }
+  }
+  return out;
 }
 
 export default function Dashboard() {
@@ -180,7 +174,9 @@ export default function Dashboard() {
   // a strip-chart recorder no matter when data actually arrives.
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
-    const heartbeat = setInterval(() => setNowTick(Date.now()), 500);
+    // 100ms (~10fps scroll). A tick only moves the X-domain; the decimated
+    // series is stable, so this stays cheap even at this rate.
+    const heartbeat = setInterval(() => setNowTick(Date.now()), 100);
     return () => clearInterval(heartbeat);
   }, []);
 
@@ -323,7 +319,7 @@ export default function Dashboard() {
     };
   }, [windowSec]);
 
-  // Wall-clock X domain: [now - window, now]. Driven by the 500ms heartbeat
+  // Wall-clock X domain: [now - window, now]. Driven by the 100ms heartbeat
   // so the strip-chart keeps scrolling in real time even when samples are
   // delayed in transit; recharts clips anything drawn past the right edge.
   const xDomain = useMemo<[number, number]>(
@@ -331,15 +327,17 @@ export default function Dashboard() {
     [nowTick, windowSec]
   );
 
-  // Keep only samples inside the visible wall-clock window, then
-  // render-decimate to <=1200 points (defends paint cost). Delayed batches
-  // render at their true acquisition timestamps, so a send-gap fills in
-  // honestly instead of being bridged with fabricated flat data.
+  // Keep only samples inside the visible wall-clock window (so the Y-axis
+  // scales to what is actually visible), then decimate into stable,
+  // time-aligned min/max buckets => <=~1200 plotted points. Both passes are a
+  // single cheap O(n) sweep with NO point reshuffling between ticks.
+  // Delayed batches render at their true acquisition timestamps, so a
+  // send-gap fills in honestly instead of being bridged with fabricated data.
   const chartData = useMemo(() => {
     const windowStart = nowTick - windowSec * 1000;
     return decimateForRender(
       history.filter((d) => d.ts >= windowStart && d.ts <= nowTick),
-      1200
+      (windowSec * 1000) / 600
     );
   }, [history, nowTick, windowSec]);
 
@@ -469,10 +467,10 @@ export default function Dashboard() {
                 labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Line type="monotone" dataKey="pga_c" stroke="#ef4444" dot={false} isAnimationActive={false} name="PGA" />
-              <Line type="monotone" dataKey="sigma_f" stroke="#3b82f6" dot={false} isAnimationActive={false} name="Sigma (fused)" />
-              <Line type="monotone" dataKey="sigma_a" stroke="#22c55e" dot={false} isAnimationActive={false} name="Sigma (ADXL)" />
-              <Line type="monotone" dataKey="sigma_m" stroke="#f59e0b" dot={false} isAnimationActive={false} name="Sigma (MPU)" />
+              <Line type="linear" dataKey="pga_c" stroke="#ef4444" dot={false} isAnimationActive={false} name="PGA" />
+              <Line type="linear" dataKey="sigma_f" stroke="#3b82f6" dot={false} isAnimationActive={false} name="Sigma (fused)" />
+              <Line type="linear" dataKey="sigma_a" stroke="#22c55e" dot={false} isAnimationActive={false} name="Sigma (ADXL)" />
+              <Line type="linear" dataKey="sigma_m" stroke="#f59e0b" dot={false} isAnimationActive={false} name="Sigma (MPU)" />
             </LineChart>
           </ResponsiveContainer>
         ) : (
@@ -500,8 +498,8 @@ export default function Dashboard() {
                 labelFormatter={(v) => fmtTimeTick(v)}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Line type="monotone" dataKey="roll" stroke="#a855f7" dot={false} isAnimationActive={false} name="Roll" />
-              <Line type="monotone" dataKey="pitch" stroke="#06b6d4" dot={false} isAnimationActive={false} name="Pitch" />
+              <Line type="linear" dataKey="roll" stroke="#a855f7" dot={false} isAnimationActive={false} name="Roll" />
+              <Line type="linear" dataKey="pitch" stroke="#06b6d4" dot={false} isAnimationActive={false} name="Pitch" />
             </LineChart>
           </ResponsiveContainer>
         ) : (
