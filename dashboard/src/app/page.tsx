@@ -19,10 +19,22 @@ import {
   ago,
   fmtTimeTick,
   normalizeSample,
-  decimateForRender,
+  decimateOne,
   breakGaps,
-  computeGapMs,
 } from "@/lib/chart-logic";
+
+// The graph always shows this fixed rolling window (seconds). One minute gives
+// a dense live trace (~12k raw samples at 200 Hz) while still fitting the
+// decimated render budget, and avoids the plateau/stale look of longer views.
+const WINDOW_SEC = 60;
+
+// A render point must fall this far past its predecessor before we treat it
+// as a real data gap. Decimated points sit ~bucketMs (50ms here) apart, so
+// normal streaming -- even slow WiFi/Realtime delivery -- never trips this.
+// 8s keeps the graph continuous through short WiFi/ring-buffer hiccups and only
+// breaks for genuine long outages (reboot, NTP re-arm, radio down), so a brief
+// stall doesn't chop the line into chunks.
+const GAP_MS = 8000;
 
 interface Live {
   node_id?: string;
@@ -52,12 +64,10 @@ export default function Dashboard() {
   const [live, setLive] = useState<Live>({});
   const [history, setHistory] = useState<Sample[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [windowSec, setWindowSec] = useState(30);
 
   // Incoming Realtime sample rows are buffered and flushed a few times per
   // second so the charts don't re-render on every single insert (~200/sec).
   const pendingRef = useRef<Sample[]>([]);
-  const windowSecRef = useRef(30);
   // Newest-sample anchor for the data-clock X axis (see dataNow below):
   // { device ts of the newest sample, Date.now() when it was observed }.
   const lastDataRef = useRef<{ ts: number; at: number } | null>(null);
@@ -70,9 +80,10 @@ export default function Dashboard() {
   // a strip-chart recorder no matter when data actually arrives.
   const [nowTick, setNowTick] = useState(() => Date.now());
   useEffect(() => {
-    // 100ms (~10fps scroll). A tick only moves the X-domain; the decimated
-    // series is stable, so this stays cheap even at this rate.
-    const heartbeat = setInterval(() => setNowTick(Date.now()), 100);
+    // 200ms (~5fps scroll). A tick only moves the X-domain; the decimated
+    // series is stable, so this stays cheap even at this rate. 100ms caused
+    // the chart to redraw its (now denser) paths needlessly often.
+    const heartbeat = setInterval(() => setNowTick(Date.now()), 200);
     return () => clearInterval(heartbeat);
   }, []);
 
@@ -141,10 +152,10 @@ export default function Dashboard() {
       setHistory((prev) => {
         // Window-aware cap: raw rows stream in at ~200 Hz, so a fixed
         // 6000-row cap would evict the older decimated snapshot rows in the
-        // 2m/5m views, visibly emptying the left side of the chart between
+        // longer views, visibly emptying the left side of the chart between
         // polls. Keep enough rows to cover the window with headroom; the
-        // render path decimates to <=1200 points anyway.
-        const cap = Math.min(Math.max(windowSecRef.current * 400, 6000), 20000);
+        // render path decimates to a point budget anyway.
+        const cap = Math.min(Math.max(WINDOW_SEC * 400, 6000), 20000);
         const next = [...prev, ...batch];
         return next.length > cap ? next.slice(-cap) : next;
       });
@@ -170,15 +181,15 @@ export default function Dashboard() {
     };
   }, []);
 
-  // History window: full 30s @ 200Hz is the fine-grained live tail; longer
-  // windows are min-max decimated server-side so the chart stays at ~6000 pts.
+  // History window: the live tail is fine-grained 200 Hz data served raw via
+  // Realtime; the periodic poll re-seeds full-resolution rows so a reload or a
+  // Realtime hiccup never leaves the chart sparse.
   useEffect(() => {
-    windowSecRef.current = windowSec;
     let mounted = true;
 
     const refresh = async () => {
       try {
-        const h = await fetch(`/api/live/history?count=6000&window=${windowSec}`, {
+        const h = await fetch(`/api/live/history?count=6000&window=${WINDOW_SEC}`, {
           cache: "no-store",
         }).then((r) => r.json());
         if (!mounted || !Array.isArray(h)) return;
@@ -188,7 +199,7 @@ export default function Dashboard() {
         // NEVER erase the graph on an empty poll. A window query legitimately
         // returns [] when the radio has been silent longer than the window;
         // wiping here replaced good data with a blank "Waiting for data..."
-        // chart on every 20s poll (the frozen-graph bug). Instead, only adopt
+        // chart on every poll (the frozen-graph bug). Instead, only adopt
         // a server snapshot when it actually contains rows, and let the
         // realtime flush keep appending raw rows the rest of the time.
         if (clean.length > 0) {
@@ -201,7 +212,7 @@ export default function Dashboard() {
           // while this poll was in flight would otherwise be chopped off the
           // tail, making the graph jump backwards on every slow poll.
           setHistory((prev) => {
-            const cap = Math.min(Math.max(windowSec * 400, 6000), 20000);
+            const cap = Math.min(Math.max(WINDOW_SEC * 400, 6000), 20000);
             const byTs = new Map<number, Sample>();
             for (const p of prev) byTs.set(p.ts, p);
             for (const c of clean) byTs.set(c.ts, c);
@@ -213,16 +224,15 @@ export default function Dashboard() {
     };
     refresh();
 
-    // Longer windows refresh less often — a 5-minute view updated every
-    // ~60s still looks live, and skips hammering the decimation fetch.
-    const pollMs = Math.min(Math.max(windowSec * 1000 / 2, 20000), 60000);
-    const slowPoll = setInterval(refresh, pollMs);
+    // Re-seed roughly every 30s — a 1-minute view refreshed at that cadence
+    // still looks live while skipping DDoS-y hammering of the fetch.
+    const slowPoll = setInterval(refresh, 30000);
 
     return () => {
       mounted = false;
       clearInterval(slowPoll);
     };
-  }, [windowSec]);
+  }, []);
 
   // Data-clock now: the newest sample DEVICE timestamp extrapolated forward
   // by real elapsed time (a Date.now() difference, so any PC clock offset
@@ -240,41 +250,40 @@ export default function Dashboard() {
   // holds a stable view (old data + flat stale tail) until fresh samples jump
   // it forward again. lastDataRef.ts is only ever updated to a NEWER sample
   // (forward-only), so dataNow never moves backwards.
-  const extrapLimitMs = Math.max(windowSec * 1000, 30000);
+  const extrapLimitMs = Math.max(WINDOW_SEC * 1000, 30000);
   const dataNow = lastDataRef.current
     ? lastDataRef.current.ts + Math.min(Math.max(nowTick - lastDataRef.current.at, 0), extrapLimitMs)
     : nowTick;
 
   // X window: [dataNow - window, dataNow] on the device own timeline.
   const xDomain = useMemo<[number, number]>(
-    () => [dataNow - windowSec * 1000, dataNow],
-    [dataNow, windowSec]
+    () => [dataNow - WINDOW_SEC * 1000, dataNow],
+    [dataNow]
   );
 
   // Keep only samples inside the visible data-clock window (so the Y-axis
-  // scales to what is actually visible), then decimate into stable,
-  // time-aligned min/max buckets => <=~1200 plotted points. Both passes are a
-  // single cheap O(n) sweep with NO point reshuffling between ticks.
-  // Delayed batches render at their true acquisition timestamps, so a
-  // send-gap fills in honestly instead of being bridged with fabricated data.
+  // scales to what is actually visible), then decimate to ONE real sample per
+  // ~50ms bucket (~1200 plotted points). Both passes are a single cheap O(n)
+  // sweep with NO point reshuffling between ticks. Delayed batches render at
+  // their true acquisition timestamps, so a send-gap fills in honestly.
   //
-  // breakGaps then inserts null bridges wherever consecutive points are more
-  // than computeGapMs apart (a WiFi stall, reboot, or send pause), so recharts
-  // (connectNulls={false}) draws a TRUE gap instead of a straight line ramping
-  // across the missing data.
+  // breakGaps then cuts the polyline wherever the device actually STOPPED
+  // acquiring (GAP_MS apart) — a long outage, reboot, or NTP re-arm no longer
+  // draws a diagonal/ramp across the silent period; it renders as a true break.
   //
   // Finally a synthetic row is stamped at dataNow carrying the newest visible
-  // sample's values: while the stream is live it's a harmless right-edge stub,
-  // and once data stops it becomes a flat "stale" tail that keeps the graph
-  // anchored and clearly showing NO new samples instead of blanking out.
+  // sample's values, so the line holds FLAT (rather than stopping) during a
+  // quiet period — clearly showing the last recorded level with no ramp. When
+  // samples resume after a real gap, the break is preserved and the line
+  // continues from the new data instead of bridging the silence.
   const chartData = useMemo(() => {
-    const windowStart = dataNow - windowSec * 1000;
-    const bucketMs = (windowSec * 1000) / 600;
+    const windowStart = dataNow - WINDOW_SEC * 1000;
+    const bucketMs = (WINDOW_SEC * 1000) / 1200;
     const filtered = history.filter((d) => d.ts >= windowStart && d.ts <= dataNow);
-    const broken = breakGaps(decimateForRender(filtered, bucketMs), computeGapMs(bucketMs));
+    const broken = breakGaps(decimateOne(filtered, bucketMs), GAP_MS);
     const last = filtered[filtered.length - 1] ?? history[history.length - 1];
     return last ? [...broken, { ...last, ts: dataNow }] : broken;
-  }, [history, dataNow, windowSec]);
+  }, [history, dataNow]);
 
   // Online if the latest live timestamp is recent, else fall back to the
   // newest history sample. Averaged against server ingestion time so a stale
@@ -317,23 +326,6 @@ export default function Dashboard() {
             : "never";
         })()}{" "}
         (PH)
-      </div>
-
-      <div className="window-row">
-        <span className="window-label">History</span>
-        {[
-          [30, "30s"],
-          [120, "2m"],
-          [300, "5m"],
-        ].map(([sec, label]) => (
-          <button
-            key={sec}
-            className={`window-btn${windowSec === sec ? " active" : ""}`}
-            onClick={() => setWindowSec(sec as number)}
-          >
-            {label}
-          </button>
-        ))}
       </div>
 
       <div className="status-row">

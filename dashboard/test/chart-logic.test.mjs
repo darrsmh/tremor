@@ -4,9 +4,8 @@ import {
   fmt,
   epochMs,
   normalizeSample,
-  decimateForRender,
+  decimateOne,
   breakGaps,
-  computeGapMs,
 } from "../src/lib/chart-logic.ts";
 
 const ts = (m) => Date.UTC(2026, 0, 1) + m * 1000;
@@ -68,51 +67,69 @@ test("normalizeSample maps null/empty metric fields to NaN", () => {
   assert.ok(Number.isNaN(s.sigma_f));
 });
 
-test("decimateForRender returns input unchanged for empty/bad input", () => {
-  assert.deepEqual(decimateForRender([], 1000), []);
+test("decimateOne returns input unchanged for empty/bad input", () => {
+  assert.deepEqual(decimateOne([], 1000), []);
   const one = { ts: 1, pga_c: 1, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 };
-  assert.deepEqual(decimateForRender([one], 0), [one]);
+  assert.deepEqual(decimateOne([one], 0), [one]);
+  assert.deepEqual(decimateOne([one], 1000), [one]);
 });
 
-test("decimateForRender keeps min and max PGA per bucket, preserves spikes", () => {
-  const rows = [];
+test("decimateOne keeps exactly one real sample per bucket", () => {
   const base = Date.UTC(2026, 0, 1);
-  // 5 samples in bucket 0 (bucketMs=1000 → one bucket)
-  rows.push({ ts: base, pga_c: 0.5, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
-  rows.push({ ts: base + 200, pga_c: 0.9, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
+  const rows = [];
+  // 5 samples spread across bucket 0 (bucketMs=1000 → all share bucket 0)
+  rows.push({ ts: base + 100, pga_c: 0.5, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
+  rows.push({ ts: base + 300, pga_c: 0.9, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
   rows.push({ ts: base + 400, pga_c: 0.02, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
   rows.push({ ts: base + 600, pga_c: 0.7, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
-  rows.push({ ts: base + 800, pga_c: 0.1, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
+  rows.push({ ts: base + 900, pga_c: 0.1, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
 
-  const out = decimateForRender(rows, 1000);
-  assert.equal(out.length, 2);
-  assert.equal(out[0].pga_c, 0.9); // max (ts earlier) first — spike survives
-  assert.equal(out[1].pga_c, 0.02); // min (ts later)
+  const out = decimateOne(rows, 1000);
+  assert.equal(out.length, 1);
+  // bucket 0 center = 500ms → the 400ms row is closest and must be kept as-is
+  assert.equal(out[0].ts, base + 400);
+  assert.equal(out[0].pga_c, 0.02);
 });
 
-test("decimateForRender is stable across repeated calls (no reshuffle)", () => {
+test("decimateOne spans multiple buckets in ascending ts order", () => {
   const base = Date.UTC(2026, 0, 1);
-  const mk = (i) => ({
-    ts: base + i * 100,
-    pga_c: 0.1 + ((i * 37) % 10) / 100,
-    sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0,
-  });
-  const rows = Array.from({ length: 1200 }, (_, i) => mk(i));
-  const a = decimateForRender(rows, 500);
-  const b = decimateForRender(rows, 500);
-  assert.deepEqual(a, b);
+  const rows = [];
+  for (let i = 0; i < 20; i++) {
+    rows.push({ ts: base + i * 250, pga_c: i / 100, sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0 });
+  }
+  const out = decimateOne(rows, 1000); // 250ms spacing → 4 samples/bucket
+  assert.equal(out.length, 5); // buckets [0,1000)..[4000,5000)
+  for (let i = 1; i < out.length; i++) {
+    assert.ok(out[i].ts > out[i - 1].ts, "output sorted ascending by ts");
+  }
 });
 
-test("decimateForRender caps points to ~2 per bucket", () => {
+test("decimateOne never invents data — every output row exists in the input", () => {
   const base = Date.UTC(2026, 0, 1);
   const rows = Array.from({ length: 1200 }, (_, i) => ({
     ts: base + i * 10,
     pga_c: Math.sin(i / 50) * 0.1 + 0.1,
     sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0,
   }));
-  const buckets = 600; // bucketMs = (window/600) typical
-  const out = decimateForRender(rows, 500);
-  assert.ok(out.length <= 1200, `expected <=1200, got ${out.length}`);
+  const out = decimateOne(rows, 500);
+  const inSet = new Set(rows.map((r) => r.ts));
+  assert.ok(out.length >= 2 && out.length <= rows.length, `out length ${out.length}`);
+  for (const r of out) {
+    assert.ok(inSet.has(r.ts), `output ts ${r.ts} not an actual input sample`);
+  }
+});
+
+test("decimateOne is stable and caps to 1 point per bucket", () => {
+  const base = Date.UTC(2026, 0, 1);
+  const rows = Array.from({ length: 1200 }, (_, i) => ({
+    ts: base + i * 10,
+    pga_c: Math.sin(i / 50) * 0.1 + 0.1,
+    sigma_f: 0, sigma_a: 0, sigma_m: 0, snr_db: 0, roll: 0, pitch: 0,
+  }));
+  const a = decimateOne(rows, 500);
+  const b = decimateOne(rows, 500);
+  assert.deepEqual(a, b);
+  assert.ok(a.length <= 1200, `expected <=1200 points, got ${a.length}`);
 });
 
 const mkSample = (ts, pga = 0.05) => ({
@@ -121,37 +138,31 @@ const mkSample = (ts, pga = 0.05) => ({
 
 test("breakGaps leaves a healthy continuous stream untouched", () => {
   const base = Date.UTC(2026, 0, 1);
-  const rows = Array.from({ length: 100 }, (_, i) => mkSample(base + i * 5));
-  const out = breakGaps(rows, 1000);
+  const rows = Array.from({ length: 1000 }, (_, i) => mkSample(base + i * 5)); // 200Hz-style
+  const out = breakGaps(rows, 2000);
   assert.equal(out.length, rows.length);
 });
 
-test("breakGaps inserts one null bridge across a large gap", () => {
+test("breakGaps inserts exactly one null bridge across a real gap", () => {
   const base = Date.UTC(2026, 0, 1);
-  const rows = [mkSample(base, 0.1), mkSample(base + 2000, 0.2), mkSample(base + 2005, 0.21)];
-  const out = breakGaps(rows, 1000);
+  const rows = [mkSample(base, 0.1), mkSample(base + 500, 0.2), mkSample(base + 30000, 0.21)];
+  const out = breakGaps(rows, 2000);
   assert.equal(out.length, 4); // 3 rows + 1 bridge
   const bridge = out.find((r) => r.pga_c === null);
   assert.ok(bridge, "expected a null-bridge row");
-  assert.ok(bridge.ts > base && bridge.ts < base + 2000, "bridge sits inside the gap");
+  assert.ok(bridge.ts > base + 500 && bridge.ts < base + 30000, "bridge sits inside the gap");
   assert.equal(bridge.sigma_f, null);
   assert.equal(bridge.roll, null);
 });
 
-test("breakGaps does not bridge historic uptime-vs-epoch or boot-jump transitions blindly", () => {
+test("breakGaps tolerates a modest delivery delay (no break on batch gaps)", () => {
   const base = Date.UTC(2026, 0, 1);
-  const rows = [mkSample(base, 1), mkSample(base + 100000, 2)]; // 100s gap
-  assert.equal(breakGaps(rows, 1000).length, 3);
+  const rows = [mkSample(base), mkSample(base + 1800)]; // under GAP_MS
+  assert.equal(breakGaps(rows, 2000).length, 2);
 });
 
 test("breakGaps returns input unchanged for empty or single rows", () => {
-  assert.deepEqual(breakGaps([], 100), []);
+  assert.deepEqual(breakGaps([], 2000), []);
   const one = mkSample(Date.UTC(2026, 0, 1));
-  assert.deepEqual(breakGaps([one], 100), [one]);
-});
-
-test("computeGapMs never drops below 1s and scales with bucket width", () => {
-  assert.equal(computeGapMs(50), 1000); // 30s window → 50ms buckets
-  assert.equal(computeGapMs(200), 1000); // 2m window
-  assert.equal(computeGapMs(500), 1500); // 5m window
+  assert.deepEqual(breakGaps([one], 2000), [one]);
 });

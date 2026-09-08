@@ -78,53 +78,37 @@ export function normalizeSample(row: Record<string, unknown>): Sample | null {
   };
 }
 
-// Stable render decimation: time-aligned min/max buckets. Rows are grouped by
-// floor(ts / bucketMs) and the min-PGA and max-PGA rows of each bucket are
-// kept (<= 2 rows per bucket, so ~600 buckets => <=~1200 plotted points).
-// Bucket edges are pinned to ABSOLUTE epoch time -- not to row indexes -- so
-// the chosen points do NOT reshuffle as the window slides or old rows age
-// out. min+max preserves PGA spikes, matching what the server-side
-// get_samples_window RPC already returns for long windows.
-export function decimateForRender(rows: Sample[], bucketMs: number): Sample[] {
-  const n = rows.length;
-  if (!(bucketMs > 0) || n === 0) return rows;
+// Stable render decimation: ONE real sample per time-aligned bucket. Rows are
+// grouped by floor(ts / bucketMs) and the row whose ts is nearest the bucket
+// center is kept, so every plotted point is a genuine detected value. Bucket
+// edges are pinned to ABSOLUTE epoch time -- not to row indexes -- so the
+// chosen points do NOT reshuffle as the window slides or old rows age out.
+//
+// (The previous min+max-per-bucket pass kept two extreme rows per bucket -- a
+// low then a high, ~every bucket -- which rendered as a spiky "comb" even when
+// the underlying signal was flat.)
+export function decimateOne(rows: Sample[], bucketMs: number): Sample[] {
+  if (!(bucketMs > 0) || rows.length < 2) return rows;
 
-  const lo = new Map<number, Sample>();
-  const hi = new Map<number, Sample>();
+  const picked = new Map<number, Sample>();
   for (const r of rows) {
     const b = Math.floor(r.ts / bucketMs);
-    const curLo = lo.get(b);
-    if (!curLo || r.pga_c < curLo.pga_c || (r.pga_c === curLo.pga_c && r.ts < curLo.ts)) {
-      lo.set(b, r);
-    }
-    const curHi = hi.get(b);
-    if (!curHi || r.pga_c > curHi.pga_c || (r.pga_c === curHi.pga_c && r.ts > curHi.ts)) {
-      hi.set(b, r);
+    const center = (b + 0.5) * bucketMs;
+    const cur = picked.get(b);
+    if (!cur || Math.abs(r.ts - center) < Math.abs(cur.ts - center)) {
+      picked.set(b, r);
     }
   }
-
-  const out: Sample[] = [];
-  const keys = [...lo.keys()].sort((a, b) => a - b);
-  for (const b of keys) {
-    const l = lo.get(b);
-    const h = hi.get(b);
-    if (!l || !h) continue;
-    if (l === h) {
-      out.push(l);
-    } else if (l.ts < h.ts) {
-      out.push(l, h);
-    } else {
-      out.push(h, l);
-    }
-  }
-  return out;
+  return [...picked.values()].sort((a, b) => a.ts - b.ts);
 }
 
-// Trace gaps in the serialized (decimated) series by inserting a null bridge
-// row mid-gap. Recharts (connectNulls=false) breaks the polyline at null
-// points, so a WiFi stall / device reboot / send gap renders as a TRUE gap
-// instead of a straight line interpolated across missing data. The bridge row
-// carries ts (for stable X placement) but all metrics set to null.
+// Split the (decimated) series at genuine ACQUISITION gaps. Between the last
+// sample before a stall/reboot and the first sample after it there is no data,
+// so drawing a straight line back and forth would fabricate a ramp across
+// silence. Inserting one null bridge mid-gap makes recharts (connectNulls=false)
+// break the polyline instead: within a live 200 Hz stream the rendered points
+// sit ~bucketMs apart, far below gapMs, so normal streaming (even slow WiFi
+// delivery) is never cut -- only real missing-data periods are.
 export function breakGaps(rows: Sample[], gapMs: number): Sample[] {
   if (!(gapMs > 0) || rows.length < 2) return rows;
 
@@ -146,8 +130,4 @@ export function breakGaps(rows: Sample[], gapMs: number): Sample[] {
     out.push(rows[i]);
   }
   return out;
-}
-
-export function computeGapMs(bucketMs: number): number {
-  return Math.max(bucketMs * 3, 1000);
 }
