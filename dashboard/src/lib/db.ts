@@ -11,19 +11,21 @@ function sb() {
 
 export async function updateLive(data: Record<string, unknown>) {
   const { node_id, ...fields } = data;
-  await sb()
+  const { error } = await sb()
     .from("live_state")
     .upsert(
       { node_id: node_id ?? "ADXL345-01", ...fields, updated_at: new Date().toISOString() },
       { onConflict: "node_id" }
     );
+  if (error) console.error("[db] live_state upsert failed:", error.message);
 }
 
 export async function getLive() {
-  const { data } = await sb()
+  const { data, error } = await sb()
     .from("live_state")
     .select("*")
     .eq("node_id", "ADXL345-01");
+  if (error) console.error("[db] live_state query failed:", error.message);
   return (data?.[0] ?? {}) as Record<string, unknown>;
 }
 
@@ -45,15 +47,21 @@ export async function pushSamples(samples: object[]) {
       pitch: r.pitch,
     };
   });
-  await sb().from("samples").insert(rows);
+  const { error } = await sb().from("samples").insert(rows);
+  // Surface insert failures. A silent failure here (e.g. trim-trigger
+  // statement timeouts) made the API return 200 while every batch was
+  // dropped, freezing the dashboard graph/values while live_state kept
+  // updating and the ESP32 kept advancing its ring-buffer tail.
+  if (error) throw new Error(`samples insert failed: ${error.message}`);
 }
 
 export async function getSamples(count = 200) {
-  const { data } = await sb()
+  const { data, error } = await sb()
     .from("samples")
     .select(SAMPLE_COLUMNS)
     .order("ts", { ascending: false })
     .limit(Math.min(count, 6000));
+  if (error) console.error("[db] samples query failed:", error.message);
   return (data ?? []).reverse();
 }
 
@@ -85,7 +93,7 @@ export async function getSamplesWindowed(count = 6000, windowSeconds = 30) {
 
 export async function pushAlert(alert: object) {
   const r = alert as Record<string, unknown>;
-  await sb().from("alerts").insert({
+  const { error } = await sb().from("alerts").insert({
     node_id: r.node_id,
     event_type: r.event_type,
     pga: r.pga,
@@ -101,13 +109,16 @@ export async function pushAlert(alert: object) {
     noise_reduction_eta: r.noise_reduction_eta,
     noise_reduction_pct: r.noise_reduction_pct,
   });
+  if (error) throw new Error(`alerts insert failed: ${error.message}`);
 }
 
 export async function getAlerts(count = 20) {
   const { data } = await sb()
     .from("alerts")
     .select("*")
-    .order("ts_ms", { ascending: false })
+    // nullsFirst: false — Postgres puts NULLS FIRST on a DESC order, which
+    // surfaced empty alert rows (all fields NULL) at the top of the list.
+    .order("ts_ms", { ascending: false, nullsFirst: false })
     .limit(count);
   return data ?? [];
 }
@@ -115,12 +126,13 @@ export async function getAlerts(count = 20) {
 // ── Heartbeats ────────────────────────────────────────────────
 
 export async function setHeartbeat(nodeId: string, data: Record<string, unknown>) {
-  await sb()
+  const { error } = await sb()
     .from("heartbeats")
     .upsert(
       { node_id: nodeId, ...data, updated_at: new Date().toISOString() },
       { onConflict: "node_id" }
     );
+  if (error) console.error("[db] heartbeats upsert failed:", error.message);
 }
 
 export async function getHeartbeat(nodeId: string) {
